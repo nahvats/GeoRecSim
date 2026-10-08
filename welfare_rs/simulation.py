@@ -359,6 +359,24 @@ class Simulation:
             return float(params.TASTE_PARAMS["match_bonus"])
         return 0.0
 
+    def realised_activity_utility(self, agent, subtype, place_id):
+        """The activity benefit V a leisure trip is credited with on arrival.
+
+        Subtype base, intrinsic and escape motivation, and the realised taste
+        match at the venue actually reached. This is the V of the welfare
+        metric (``leisure_net_utility``) and of the like/dislike the platform
+        learns from; the Oracle recommender ranks with it too, so what the
+        oracle optimises and what the run is scored on cannot drift apart.
+        """
+        uw = params.UTILITY_WEIGHTS
+        seg_cfg = params.LEISURE_SEGMENTS.get(subtype, {})
+        return (
+            seg_cfg.get("activity_utility", 0.0)
+            + uw["activity_intrinsic_coeff"] * agent.motivation_weights["intrinsic"]
+            + uw["activity_escape_coeff"] * agent.motivation_weights["escape"]
+            + self.taste_bonus(agent, place_id)
+        )
+
     def sample_poi(self, subtype, origin, rng, max_km=None):
         """Sample an organic destination POI for a leisure subtype.
 
@@ -1554,15 +1572,8 @@ class Simulation:
         travel_utility = sum(attrs.values()) + sum(constants.values())
         activity_utility = 0.0
         if with_activity and next_activity.type == "leisure" and next_activity.subtype:
-            seg_cfg = params.LEISURE_SEGMENTS.get(next_activity.subtype, {})
-            activity_utility += seg_cfg.get("activity_utility", 0.0)
-            activity_utility += uw["activity_intrinsic_coeff"] * agent.motivation_weights["intrinsic"]
-            activity_utility += uw["activity_escape_coeff"] * agent.motivation_weights["escape"]
-            # Realised taste match at the destination actually reached. This is
-            # the term that flows into the trip's activity_utility, hence into
-            # leisure_net_utility (the welfare metric) and into the like/dislike
-            # the platform learns from.
-            activity_utility += self.taste_bonus(agent, next_activity.place_id)
+            activity_utility = self.realised_activity_utility(
+                agent, next_activity.subtype, next_activity.place_id)
         utility = travel_utility + activity_utility
 
         return {

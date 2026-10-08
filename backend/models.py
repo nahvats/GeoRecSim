@@ -7,8 +7,8 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from service import (DEFAULT_CITY, MAX_RECOMMENDERS, MAX_SEEDS, TREATMENTS,
-                     RecommenderSpec, RunConfig, WELFARE_GATES)
+from service import (DEFAULT_CITY, MAX_RECOMMENDERS, MAX_SEEDS, RESERVED_LABELS,
+                     TREATMENTS, RecommenderSpec, RunConfig, WELFARE_GATES)
 
 
 class RecommenderSpecRequest(BaseModel):
@@ -122,7 +122,9 @@ class RunRequest(BaseModel):
         are suffixed rather than dropped, since the user did ask for two.
         """
         out: List[RecommenderSpecRequest] = []
-        seen: dict = {}
+        # The pinned controls' labels count as taken, so an arm the user named
+        # "Oracle" becomes "Oracle (2)" rather than colliding with the control.
+        seen: dict = {label: 1 for label in RESERVED_LABELS}
         for spec in value[:MAX_RECOMMENDERS]:
             label = (spec.label or "Custom RS").strip() or "Custom RS"
             if label in seen:

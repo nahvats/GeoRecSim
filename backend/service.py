@@ -77,10 +77,19 @@ import viz
 #: paired comparison is defined against.
 CONTROL = "No RS"
 
+#: The Oracle control (welfare_rs.oracle_rs). Also always run: the
+#: perfect-knowledge upper bound every built recommender is read against, as in
+#: Uğurel & Yabe (2026), whose tables report it beside every condition.
+ORACLE = "Oracle"
+
+#: Labels a user-built recommender may not take, since condition labels are
+#: the identity of an arm everywhere downstream.
+RESERVED_LABELS = (CONTROL, ORACLE)
+
 #: Welfare gates a built recommender may wear on top of its ranking.
 WELFARE_GATES = ("pup", "rm", "pup_rm")
 
-#: Ceiling on user-built recommenders in one study (the control is extra).
+#: Ceiling on user-built recommenders in one study (the controls are extra).
 #: Cost and retained map geometry both scale linearly in arms.
 MAX_RECOMMENDERS = 5
 
@@ -152,7 +161,7 @@ def _worker_count(n_tasks: int) -> int:
 # Studies allowed to run at once. They no longer queue behind each other: the
 # box's CPU budget is split evenly between however many are running, so two
 # studies get half the cores each and widen back out as one finishes.
-MAX_STUDIES = int(os.environ.get("WELFARE_RS_MAX_STUDIES", "0") or 0) or 4
+MAX_STUDIES = int(os.environ.get("WELFARE_RS_MAX_STUDIES", "0") or 0) or 10
 
 # RAM headroom kept free. Each simulation process holds its own copy of the
 # metro graph (a few hundred MB); the routing matrices are memmapped, so they
@@ -365,6 +374,10 @@ class RecommenderSpec:
     pup_alpha: float = 0.6
     rm_epsilon: float = 0.3
     random_ranking: bool = False
+    #: The perfect-knowledge upper bound (welfare_rs.oracle_rs): ranks by each
+    #: agent's true net utility, so every weight, random_ranking and the
+    #: welfare gate are ignored.
+    oracle: bool = False
 
     def to_engine_config(self) -> RecommenderConfig:
         return RecommenderConfig(
@@ -394,7 +407,9 @@ class RecommenderSpec:
             round(self.learning_rate, 4), self.welfare_gate,
             round(self.pup_alpha, 4), round(self.rm_epsilon, 4),
             bool(self.random_ranking),
-        )
+        # Appended only when set, so every non-oracle spec keeps the identity,
+        # and therefore the run id, it had before the oracle existed.
+        ) + ((("oracle", True),) if self.oracle else ())
 
 
 def spec_from_legacy_name(
@@ -434,21 +449,26 @@ class RunConfig:
         return [int(self.seed) + i for i in range(n)]
 
     def all_conditions(self) -> List[str]:
-        """``[CONTROL, *built recommenders]`` in the order the user built them.
+        """``[CONTROL, ORACLE, *built recommenders]``, the built ones in the
+        order the user built them.
 
-        The control is always present and always first: every Table-2 row is
-        defined relative to it. Order is the user's, not canonical — with
+        The No-RS control is always present and always first: every Table-2 row
+        is defined relative to it. The Oracle is always present and second, so
+        each study carries its own upper bound. Order is the user's, not canonical — with
         free-form labels there is no canonical order to impose, and the run id
         folds in the sequence so a reordered study is a different (correctly
         re-run) study rather than a stale cache hit.
         """
-        return [CONTROL] + [s.label for s in self.recommenders]
+        return [CONTROL, ORACLE] + [s.label for s in self.recommenders]
 
     def run_id(self) -> str:
         key = (
             self.city, int(self.num_agents), int(self.num_days), int(self.seed),
             int(self.num_seeds), tuple(s.identity() for s in self.recommenders),
             bool(self.use_real_pois),
+            # A study cached before the Oracle control existed has no Oracle
+            # arm, so it must not be handed back for the same settings.
+            "oracle_control",
         )
         return hashlib.sha1(repr(key).encode()).hexdigest()[:16]
 
@@ -493,11 +513,12 @@ class Run:
     duration_sec: Optional[float] = None
 
     def default_condition(self) -> str:
-        """What the map opens on: the first recommender, else the No-RS control."""
+        """What the map opens on: the first built recommender, else the Oracle,
+        else the No-RS control (a study saved before the Oracle existed)."""
         for c in self.conditions:
-            if c != CONTROL:
+            if c not in RESERVED_LABELS:
                 return c
-        return CONTROL
+        return ORACLE if ORACLE in self.conditions else CONTROL
 
     def meta(self) -> dict:
         """Aggregated metrics + per-condition/seed index (no geometry)."""
@@ -641,11 +662,18 @@ class Job:
 # ── Recommender wiring (welfare gate) ────────────────────────────────────────
 
 def _make_recommender_factory(spec: Optional[RecommenderSpec]):
-    """Wrap the built recommender in its welfare gate, if it has one.
+    """Wrap the built recommender in its welfare gate, if it has one, or swap
+    it for the oracle.
 
     Returns None when the spec is ungated (or absent), which leaves the
     simulation's own configurable recommender in place unwrapped.
     """
+    if spec is not None and spec.oracle:
+        # Ungated, as in the paper: the gate scores from rec.score, which the
+        # oracle holds at a neutral constant, so a gate would filter on noise.
+        from welfare_rs.oracle_rs import oracle_factory
+
+        return oracle_factory(spec.label)
     if spec is None or spec.welfare_gate not in WELFARE_GATES:
         return None
     from welfare_rs import TravelCostEstimator, WelfareAwareOrchestrator
@@ -691,7 +719,7 @@ _WORKER_NET_CACHE: Dict[tuple, object] = {}
 
 
 def _spec_for(cfg: dict, condition: str) -> Optional[RecommenderSpec]:
-    """The spec driving ``condition``, or None for the control.
+    """The spec driving ``condition``, or None for the No-RS control.
 
     Specs travel into the worker as plain dicts (``asdict`` on the config), so
     they are rebuilt here rather than unpickled as dataclasses — keeping the
@@ -699,6 +727,8 @@ def _spec_for(cfg: dict, condition: str) -> Optional[RecommenderSpec]:
     """
     if condition == CONTROL:
         return None
+    if condition == ORACLE:
+        return RecommenderSpec(label=ORACLE, oracle=True)
     for raw in cfg.get("recommenders", ()):
         if raw.get("label") == condition:
             return RecommenderSpec(**raw)

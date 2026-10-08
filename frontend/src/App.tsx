@@ -279,7 +279,7 @@ export default function App() {
                         {runMeta.conditions.map((c) => (
                           <option key={c} value={c}>
                             {condLabel(c)}
-                            {c === "No RS" ? " (control)" : ""}
+                            {c === "No RS" ? " (control)" : c === "Oracle" ? " (upper bound)" : ""}
                           </option>
                         ))}
                       </select>

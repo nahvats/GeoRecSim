@@ -43,7 +43,7 @@ from fastapi.staticfiles import StaticFiles
 
 import viz
 from models import RunRequest
-from service import (CITIES, CONTROL, GOVERNOR, MAX_RECOMMENDERS, MAX_STUDIES,
+from service import (CITIES, CONTROL, ORACLE, GOVERNOR, MAX_RECOMMENDERS, MAX_STUDIES,
                      TREATMENTS, RunConfig,
                      manager, precomputed_cities, warmed_cities)
 from welfare_rs.recommender_systems import RECOMMENDER_PRESETS
@@ -159,6 +159,8 @@ def cities() -> dict:
             {"name": name, **values} for name, values in RECOMMENDER_PRESETS.items()
         ],
         "control": CONTROL,
+        # The second always-run control: the perfect-knowledge upper bound.
+        "oracle": ORACLE,
         "max_recommenders": MAX_RECOMMENDERS,
         # Deprecated fixed vocabulary, still accepted on POST /api/runs.
         "treatments": TREATMENTS,

@@ -322,7 +322,7 @@ class ExperimentHarness:
         # NOTE: Full integration requires:
         # 1. Create Simulation with matched seed
         # 2. Configure WelfareAwareOrchestrator with treatment mode
-        # 3. For "oracle" mode, register all agents with OracleRecommender
+        # 3. For "oracle" mode, pass oracle_rs.oracle_factory() as recommender_factory
         # 4. For "no_rs" mode, disable recommender_stack
         # 5. Run simulation for num_days
         # 6. Collect per-agent and per-trip utilities

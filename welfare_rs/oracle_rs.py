@@ -1,215 +1,155 @@
-"""Oracle recommender system — perfect-knowledge upper bound.
+"""Oracle recommender — the perfect-knowledge upper bound.
 
-The Oracle RS has access to the agent's true utility function and always
-recommends the activity that maximizes the agent's net utility (V^act - C^travel).
-This serves as an upper bound on what any recommender could achieve.
+Uğurel & Yabe (2026), *Towards welfare-oriented recommendations in
+activity-travel behavior*, §4 condition 5: "A hypothetical recommender with
+perfect knowledge of each agent's true preference vector β_i, including their
+value of time, time and cost sensitivities, leisure preferences, and
+subtype-specific utility bonuses. It computes the exact net utility
+U_ik = V_ik − C_ik for every candidate and returns the optimal ranking. This
+condition provides an upper bound on achievable welfare."
+
+Mapped onto this model, for the subtype the agent has already chosen:
+
+``V_ik``  :meth:`Simulation.realised_activity_utility` — the benefit the trip
+          is credited with on arrival, latent taste match included. The other
+          recommenders cannot observe the taste term; the oracle reads it.
+``C_ik``  :meth:`Agent._price_round_trip` — the agent's own expected cost of
+          the round trip: time x its value of time + money, each mode weighted
+          by the probability this agent takes it under its own decision rule,
+          scaled by its trip-burden sensitivity. The same cost model the agent
+          ranks its own options with and prices eta's dC with.
+
+Like the paper's oracle it ranks on the ex-ante view: free-flow roads and the
+expected mode mix, not the congestion the trip will meet or the mode actually
+drawn at departure. It also does not see the agent's organic alternative. So it
+can still leave an agent worse off than No RS would have, as the paper's oracle
+did (27.8% harmed, its Table 2).
+
+What it deliberately does NOT change is the acceptance machinery. Every
+recommendation carries a neutral score of 0.5, so eta's quality term
+``quality_weight * (score - 0.5)`` is zero, and acceptance still responds to
+trust, autonomy, dC and memory exactly as under any other arm. The gap between
+this arm and the rest is therefore ranking knowledge alone. Net utility is
+reported in ``components`` for inspection.
+
+It has nothing to learn, so private feedback is ignored. Public feedback (the
+like/dislike that moves a venue's live rating) still flows, because the
+simulation records it on the shared PlaceDynamics, not on the recommender.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List
 
-from .recommender_systems import (
-    LEISURE_SUBTYPE_TO_CATEGORIES,
-    Place,
-    Recommendation,
-    RecommenderSystem,
-    UserContext,
-)
+from .recommender_systems import Recommendation, RecommenderSystem, UserContext
 from .utils import haversine_km
 
-
-@dataclass
-class AgentTruePreferences:
-    """True preference parameters for an agent (known only to Oracle).
-
-    In a real system these would be unobservable. The Oracle uses them
-    to compute the true utility for each candidate place.
-
-    Attributes:
-        user_id: Agent identifier.
-        vot: Value of time ($/hr).
-        pref_time: Time sensitivity weight.
-        pref_cost: Cost sensitivity weight.
-        motivation_weights: Dict of motivation type → weight.
-        leisure_preferences: Dict of subtype → preference multiplier.
-        subtype_utility_bonuses: Dict of subtype → extra utility terms.
-    """
-
-    user_id: int
-    vot: float
-    pref_time: float
-    pref_cost: float
-    motivation_weights: Dict[str, float]
-    leisure_preferences: Dict[str, float]
-    subtype_utility_bonuses: Dict[str, float]
+#: The score every oracle recommendation carries. Neutral on eta's quality term
+#: (see the module docstring), and inside the [0, 1] range every arm's scores
+#: share.
+NEUTRAL_SCORE = 0.5
 
 
 class OracleRecommender(RecommenderSystem):
-    """Perfect-knowledge recommender that maximizes true agent utility.
+    """Ranks every candidate of the subtype by the agent's true net utility.
 
-    Given access to agent preferences (via register_agent), it computes
-    the exact net utility U = V^act - C^travel for every candidate and
-    returns the optimal ranking.
+    ``env`` is the owning Simulation, from which the oracle reads the agent
+    itself — its tastes, value of time and cost sensitivities. That access is
+    what no other recommender has.
     """
 
-    def __init__(
-        self,
-        catalog: Sequence[Place],
-        coord_scale_km: float = 1.0,
-        default_speed_kmh: float = 20.0,
-        cost_per_km: float = 0.15,
-    ):
-        super().__init__(name="oracle", catalog=catalog)
-        self.coord_scale_km = coord_scale_km
-        self.default_speed_kmh = default_speed_kmh
-        self.cost_per_km = cost_per_km
-        self.agent_prefs: Dict[int, AgentTruePreferences] = {}
+    def __init__(self, env, label: str = "Oracle"):
+        super().__init__(name=label, catalog=env.place_catalog)
+        self.env = env
+        self._agent_by_id = {a.id: a for a in env.agents}
 
-    def register_agent(self, prefs: AgentTruePreferences) -> None:
-        """Register an agent's true preferences (simulation-only)."""
-        self.agent_prefs[prefs.user_id] = prefs
-
-    def _true_activity_utility(
-        self,
-        place: Place,
-        prefs: AgentTruePreferences,
-        leisure_subtype: str,
-    ) -> float:
-        """Compute true V^act for a place given true preferences."""
-        # Base rating signal
-        base = place.rating / 5.0
-
-        # Preference fit for the subtype
-        pref_multiplier = prefs.leisure_preferences.get(leisure_subtype, 1.0)
-
-        # Subtype-specific bonus (from agent personality/motivation)
-        subtype_bonus = prefs.subtype_utility_bonuses.get(leisure_subtype, 0.0)
-
-        # Intrinsic motivation contribution
-        intrinsic = prefs.motivation_weights.get("intrinsic", 0.25) * 0.3
-
-        return base * pref_multiplier + subtype_bonus + intrinsic
-
-    def _true_travel_cost(
-        self,
-        place: Place,
-        user_location: Tuple[float, float],
-        prefs: AgentTruePreferences,
-    ) -> float:
-        """Compute true C^travel for reaching a place."""
-        dist_km = haversine_km(user_location, place.location) * self.coord_scale_km
-        travel_time_hr = dist_km / max(1.0, self.default_speed_kmh)
-        monetary_cost = dist_km * self.cost_per_km
-
-        # C^travel = β^time · τ · v_i + β^cost · κ
-        return (
-            prefs.pref_time * travel_time_hr * prefs.vot
-            + prefs.pref_cost * monetary_cost
-        )
+    def true_net_utility(self, agent, user: UserContext, leisure_subtype: str, place):
+        """``(U, V, C)`` for sending ``agent`` to ``place``, or None when no mode
+        it may use makes the round trip."""
+        cost = agent._price_round_trip(self.env, user.location, place.location, leisure_subtype)
+        if cost is None:
+            return None
+        value = self.env.realised_activity_utility(agent, leisure_subtype, place.place_id)
+        return value - cost, value, cost
 
     def recommend(
-        self,
-        user: UserContext,
-        leisure_subtype: str,
-        top_k: int = 5,
+        self, user: UserContext, leisure_subtype: str, top_k: int = 5
     ) -> List[Recommendation]:
-        """Return recommendations ranked by true net utility."""
-        prefs = self.agent_prefs.get(user.user_id)
-        if prefs is None:
-            # Fallback: no oracle knowledge, return by rating
-            candidates = self._filter_by_subtype(leisure_subtype)
-            candidates.sort(key=lambda p: p.rating, reverse=True)
-            return [
-                Recommendation(
-                    source=self.name,
-                    place=p,
-                    score=p.rating / 5.0,
-                    components={"rating": p.rating / 5.0},
-                )
-                for p in candidates[:top_k]
-            ]
+        agent = self._agent_by_id.get(user.user_id)
+        if agent is None:
+            # Every simulated agent is registered at construction, so this is a
+            # wiring error, not a cold start. An oracle that quietly fell back
+            # to some heuristic would report that heuristic as the upper bound.
+            raise KeyError(f"Oracle has no agent {user.user_id}")
 
         candidates = self._filter_by_subtype(leisure_subtype)
-        if not candidates:
-            return []
+        # Same straight-line reach bound the agent's organic draw uses
+        # (Simulation.sample_poi). It only removes venues that pricing below
+        # would reject anyway, since network distance is never shorter.
+        reach_km = self.env.reach_limit_km(agent)
+        if reach_km is not None:
+            candidates = [p for p in candidates
+                          if haversine_km(user.location, p.location) <= reach_km]
 
         scored = []
         for place in candidates:
-            v_act = self._true_activity_utility(place, prefs, leisure_subtype)
-            c_travel = self._true_travel_cost(place, user.location, prefs)
-            net_utility = v_act - c_travel
-
-            scored.append(
-                Recommendation(
-                    source=self.name,
-                    place=place,
-                    score=net_utility,
-                    components={
-                        "v_act": v_act,
-                        "c_travel": c_travel,
-                        "net_utility": net_utility,
-                    },
-                )
+            priced = self.true_net_utility(agent, user, leisure_subtype, place)
+            if priced is None:
+                continue
+            net, value, cost = priced
+            scored.append((net, place.place_id, place, value, cost))
+        # Tie-break on place_id, as ConfigurableRecommender does, so equal
+        # utilities are not decided by catalog order.
+        scored.sort(key=lambda s: (-s[0], s[1]))
+        return [
+            Recommendation(
+                source=self.name,
+                place=place,
+                score=NEUTRAL_SCORE,
+                components={"net_utility": net, "v_act": value, "c_travel": cost},
             )
+            for net, _pid, place, value, cost in scored[: max(1, top_k)]
+        ]
 
-        scored.sort(key=lambda r: r.score, reverse=True)
-        return scored[: max(1, top_k)]
+    def record_feedback(self, user_id, place_id, liked, feedback_strength=1.0,
+                        learning_rate=None) -> None:
+        """Nothing to learn: the oracle already knows the agent."""
+        del user_id, place_id, liked, feedback_strength, learning_rate
 
 
 class OracleOrchestrator:
-    """Wrap OracleRecommender with the LeisureRSOrchestrator interface."""
+    """Adapts :class:`OracleRecommender` to the orchestrator interface.
 
-    def __init__(self, oracle_rs: OracleRecommender):
-        self.oracle = oracle_rs
+    Returns a one-element list. Agent.plan_day takes ``max`` by score over
+    what comes back, and every oracle score is the same neutral value, so the
+    optimum is the only element offered — the choice cannot fall to tie order.
+    """
+
+    def __init__(self, oracle: OracleRecommender):
+        self.oracle = oracle
+
+    @property
+    def name(self) -> str:
+        return self.oracle.name
 
     def recommend(
-        self,
-        user: UserContext,
-        leisure_subtype: str,
-        top_k_per_system: int = 5,
+        self, user: UserContext, leisure_subtype: str, top_k_per_system: int = 5
     ) -> Dict[str, List[Recommendation]]:
-        return {
-            self.oracle.name: self.oracle.recommend(
-                user,
-                leisure_subtype,
-                top_k=top_k_per_system,
-            )
-        }
+        del top_k_per_system  # only the optimum is ever acted on; see above
+        return {self.oracle.name: self.oracle.recommend(user, leisure_subtype, top_k=1)}
 
-    def record_feedback(
-        self,
-        user_id: int,
-        source: str,
-        place_id: str,
-        liked: bool,
-        feedback_strength: float = 1.0,
-    ) -> None:
-        del user_id, source, place_id, liked, feedback_strength
-
-    def record_continuous_feedback(self, feedback, travel_time_min: float, monetary_cost: float) -> None:
-        del feedback, travel_time_min, monetary_cost
+    def record_feedback(self, user_id, source, place_id, liked,
+                        feedback_strength: float = 1.0) -> None:
+        del source
+        self.oracle.record_feedback(user_id, place_id, liked, feedback_strength)
 
 
-def register_agent_from_abm(oracle: OracleRecommender, agent) -> None:
-    """Convenience: extract true preferences from an ABM Agent object."""
-    from . import params
+def oracle_factory(label: str = "Oracle"):
+    """A ``recommender_factory`` for :class:`Simulation` that swaps the built
+    recommender for the oracle. It needs the simulation's agents, which exist
+    by the time the factory runs."""
 
-    subtype_bonuses = {}
-    for subtype, seg_cfg in params.LEISURE_SEGMENTS.items():
-        bonus = seg_cfg.get("activity_utility", 0.0)
-        bonus += params.UTILITY_WEIGHTS["activity_intrinsic_coeff"] * agent.motivation_weights.get("intrinsic", 0.25)
-        bonus += params.UTILITY_WEIGHTS["activity_escape_coeff"] * agent.motivation_weights.get("escape", 0.2)
-        subtype_bonuses[subtype] = bonus
+    def factory(sim, _base_stack):
+        return OracleOrchestrator(OracleRecommender(sim, label=label))
 
-    prefs = AgentTruePreferences(
-        user_id=agent.id,
-        vot=getattr(agent, "vot", 15.0),
-        pref_time=agent.preferences.get("time", 1.0),
-        pref_cost=agent.preferences.get("cost", 1.0),
-        motivation_weights=dict(agent.motivation_weights),
-        leisure_preferences=dict(agent.leisure_preferences),
-        subtype_utility_bonuses=subtype_bonuses,
-    )
-    oracle.register_agent(prefs)
+    return factory

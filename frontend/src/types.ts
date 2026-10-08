@@ -38,8 +38,8 @@ export interface RunConfig {
   // so the backend draws a fresh one per run; send it only to replay a study.
   seed?: number;
   num_seeds: number;
-  // Recommenders to run. The No-RS control is always added server-side, so an
-  // empty array is a valid "control only" study.
+  // Recommenders to run. The No-RS and Oracle controls are always added
+  // server-side, so an empty array is a valid "controls only" study.
   recommenders: RecommenderSpec[];
   use_real_pois: boolean;
 }
@@ -87,6 +87,7 @@ export interface CitiesResponse {
   cities: City[];
   presets: Preset[]; // starting points for the recommender builder
   control: string; // the pinned No-RS control's label
+  oracle: string; // the pinned Oracle (upper-bound) control's label
   max_recommenders: number;
   treatments: string[]; // deprecated fixed vocabulary
   pois_available: Record<string, boolean>; // per city key

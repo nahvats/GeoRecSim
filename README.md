@@ -53,7 +53,7 @@ GET /api/resources      # studies running, slots each, slots busy, RAM headroom
 ```
 
 Knobs: `WELFARE_RS_MAX_WORKERS` (total slots), `WELFARE_RS_MAX_STUDIES`
-(default 4), `WELFARE_RS_MIN_FREE_RAM_GB` (default 24).
+(default 10), `WELFARE_RS_MIN_FREE_RAM_GB` (default 24).
 
 ## Try it without any data
 
@@ -195,7 +195,7 @@ work for engine-level experiments; the app itself only surfaces the 8 metros.
 
 ## 5. Recommenders: one scorer, many configurations
 
-A study is the **No-RS control** plus up to five recommenders the user builds in
+A study is the **No-RS control**, the **Oracle control** (below) and up to five recommenders the user builds in
 the sidebar. Every recommender is the *same* scorer with different knob values —
 the presets ("Proximity-led", "Footfall-led", "Viral", …) differ by which weights they
 zero out, not by having different machinery:
@@ -222,6 +222,18 @@ On a cold start the popularity column does not exist yet; its weight is
 redistributed over the remaining components rather than counted as a zero, which
 would otherwise cap a popularity-heavy recommender at a low score for the whole
 warm-up.
+
+**Oracle** is a second control, always run, and the one arm that is not this
+scorer. It is the perfect-knowledge upper bound of Uğurel & Yabe (2026,
+condition 5): it reads the agent's true preferences, latent tastes included, and
+offers the venue of the chosen subtype with the highest net utility
+`U = V − C`. `V` is the activity benefit the trip is credited with on arrival,
+and `C` is the agent's own expected round-trip cost, the one it ranks its own
+options with. Like the paper's oracle it ranks on the ex-ante view and does not
+see congestion or the agent's organic pick, so it can still harm some agents.
+Its score is a neutral 0.5, so eta's quality term is zero and acceptance works
+exactly as for every other arm: the gap to the other arms is ranking knowledge
+alone. Weights and the welfare gate are ignored. See `welfare_rs/oracle_rs.py`.
 
 ### Latent tastes
 

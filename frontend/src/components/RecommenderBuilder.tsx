@@ -96,6 +96,7 @@ interface Props {
   presets: Preset[];
   max: number;
   control: string;
+  oracle: string;
   disabled: boolean;
   onChange: (specs: RecommenderSpec[]) => void;
 }
@@ -105,6 +106,7 @@ export default function RecommenderBuilder({
   presets,
   max,
   control,
+  oracle,
   disabled,
   onChange,
 }: Props) {
@@ -141,6 +143,12 @@ export default function RecommenderBuilder({
         <div className="rec-card-head">
           <span className="rec-name">{control}</span>
           <span className="muted small">control · always run</span>
+        </div>
+      </div>
+      <div className="rec-card control" title="Knows each agent's true preferences — its latent tastes, value of time and cost sensitivities — and offers the venue with the highest net utility U = V − C for that agent. The upper bound on what ranking alone can achieve (Uğurel & Yabe 2026). Always run.">
+        <div className="rec-card-head">
+          <span className="rec-name">{oracle}</span>
+          <span className="muted small">upper bound · always run</span>
         </div>
       </div>
 

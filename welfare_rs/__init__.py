@@ -44,6 +44,7 @@ from .recommender_systems import (
     build_recommender_stack,
 )
 from . import metrics, tastes
+from .oracle_rs import OracleOrchestrator, OracleRecommender, oracle_factory
 from .simulation import Simulation
 from .welfare_layer import (
     ContinuousFeedback,
@@ -88,6 +89,10 @@ __all__ = [
     "PlaceDynamics",
     "UserContext",
     "Recommendation",
+    # perfect-knowledge upper bound (Uğurel & Yabe 2026, condition 5)
+    "OracleRecommender",
+    "OracleOrchestrator",
+    "oracle_factory",
     # latent tastes + dashboard metrics
     "tastes",
     "metrics",

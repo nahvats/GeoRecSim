@@ -59,7 +59,7 @@ export default function Controls({
   // Study size, for the cost hint below. Falls back to the committed seed count
   // so the number doesn't blank out while the field is mid-edit.
   const nSeeds = seeds.value ?? config.num_seeds;
-  const nConditions = specs.length + 1; // + the pinned control
+  const nConditions = specs.length + 2; // + the pinned No-RS and Oracle controls
 
   const poisAvailable = cities.pois_available[config.city] ?? false;
 
@@ -151,13 +151,15 @@ export default function Controls({
       <p className="muted">
         Build one or more. Each is the same scorer with different weights — a
         preset just sets them for you. Every recommender runs as its own
-        simulation, in parallel, against the same control.
+        simulation, in parallel, against the same control. The Oracle always
+        runs too, as the upper bound.
       </p>
       <RecommenderBuilder
         specs={specs}
         presets={cities.presets}
         max={cities.max_recommenders}
         control={cities.control}
+        oracle={cities.oracle}
         disabled={running}
         onChange={(recommenders) => setConfig({ recommenders })}
       />

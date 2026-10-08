@@ -224,7 +224,6 @@ For anyone doing a future cleanup pass:
 - **`walk_tolerance_min` outdoor discount** (`agent.py`). Never fires because the
   fixed tolerance is 15 and the threshold is 30. Parameterised, not dead.
 
-Genuine cleanup candidate, left alone pending a decision:
-**`welfare_rs/oracle_rs.py`** (215 lines, `OracleRecommender`). Not imported by
-the package, the service, the simulation or the notebook. Not one of the paper's
-two controls.
+**`welfare_rs/oracle_rs.py`** is no longer dead. It was rewritten on 2026-10-05
+as the perfect-knowledge upper bound of Uğurel & Yabe (2026, condition 5) and
+runs in every study as the always-on "Oracle" control.
