@@ -262,3 +262,8 @@ scripts/warm_all.sh
 scripts/warm_until_done.sh
 scripts/verify_watcher.sh
 HANDOFF_MAC_WARM.md
+
+# Gating threshold study (gating_study/): keep the result files, not the run logs, lock or figures
+gating_study/results/*.log
+gating_study/.run.lock
+gating_study/figures/
