@@ -9,6 +9,16 @@ chicago,6,no_rs,no_rs,,,,0.1766761975007887,1.0
 chicago,7,no_rs,no_rs,,,,0.18140620394236986,1.0
 chicago,8,no_rs,no_rs,,,,0.1947580100751823,1.0
 chicago,9,no_rs,no_rs,,,,0.18423114387019487,1.0
+chicago,0,oracle,oracle,,,,0.3866190307467075,0.0
+chicago,1,oracle,oracle,,,,0.39611677257393,0.0
+chicago,2,oracle,oracle,,,,0.36653091197468124,0.0
+chicago,3,oracle,oracle,,,,0.3637769994916262,0.0
+chicago,4,oracle,oracle,,,,0.37591737432898154,0.0
+chicago,5,oracle,oracle,,,,0.37027021822443473,0.0
+chicago,6,oracle,oracle,,,,0.3777845547143185,0.0
+chicago,7,oracle,oracle,,,,0.38250214691206696,0.0
+chicago,8,oracle,oracle,,,,0.3982013177568363,0.0
+chicago,9,oracle,oracle,,,,0.3768337139320641,0.0
 chicago,0,pup_a0.10,pup,0.1,,,0.33286251574364245,0.0391644908616188
 chicago,1,pup_a0.10,pup,0.1,,,0.32153364631100423,0.029335634167385678
 chicago,2,pup_a0.10,pup,0.1,,,0.3253125333033848,0.0326975476839237

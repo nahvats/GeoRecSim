@@ -9,6 +9,16 @@ seattle,6,no_rs,no_rs,,,,0.1228361708075617,1.0
 seattle,7,no_rs,no_rs,,,,0.12097970205742287,1.0
 seattle,8,no_rs,no_rs,,,,0.1338143400111943,1.0
 seattle,9,no_rs,no_rs,,,,0.10932298168973423,1.0
+seattle,0,oracle,oracle,,,,0.37503694148020394,0.0
+seattle,1,oracle,oracle,,,,0.3641682961493883,0.0
+seattle,2,oracle,oracle,,,,0.3587742308523738,0.0
+seattle,3,oracle,oracle,,,,0.3514305925566342,0.0
+seattle,4,oracle,oracle,,,,0.3721441177008447,0.0
+seattle,5,oracle,oracle,,,,0.3539878438936215,0.0
+seattle,6,oracle,oracle,,,,0.3679218556577669,0.0
+seattle,7,oracle,oracle,,,,0.3649857015192301,0.0
+seattle,8,oracle,oracle,,,,0.36875855089920784,0.0
+seattle,9,oracle,oracle,,,,0.33437857057444753,0.0
 seattle,0,pup_a0.10,pup,0.1,,,0.2599129197065716,0.011861313868613138
 seattle,1,pup_a0.10,pup,0.1,,,0.25035788598121755,0.008
 seattle,2,pup_a0.10,pup,0.1,,,0.26302428573770614,0.007832898172323759
