@@ -9,7 +9,9 @@ import itertools
 import math
 import random
 import warnings
+from array import array
 from collections import Counter
+from itertools import accumulate
 from pathlib import Path
 
 from typing import NamedTuple
@@ -201,6 +203,9 @@ class Simulation:
         for _subtype, _cats in LEISURE_SUBTYPE_TO_CATEGORIES.items():
             _catset = set(_cats)
             self._pois_by_subtype[_subtype] = [p for p in self.place_catalog if p.category in _catset]
+        # sample_poi's reachable places and cumulative draw weights, per
+        # (subtype, origin, reach). See sample_poi for why this is safe.
+        self._venue_draws = {}
 
         # Read by mode utility, which the planner now calls (the logsum), so it
         # has to exist before agents plan day 0.
@@ -395,24 +400,60 @@ class Simulation:
         Returns ``(location, place_id)``; falls back to a random intersection
         (with ``place_id=""``) when the catalog has no POI for the subtype, and
         returns ``(None, "")`` when none of them is within ``max_km``.
+
+        The reachable places and their weights are memoised per ``(subtype,
+        origin, max_km)``. Recomputing a haversine to every venue of the subtype
+        on every call was ~70% of a simulated day, yet the origin is always the
+        agent's home or work and venues never move. ``random.choices`` turns
+        weights into exactly these cumulative weights itself, so the draw, and
+        every random number after it, is unchanged.
         """
-        places = self._pois_by_subtype.get(subtype) or []
-        if not places:
+        if not self._pois_by_subtype.get(subtype):
             # Fallback destinations stay in the principal city on metro networks.
             return self.road_network.sample_core_latlon(self._loc_rng), ""
-        if max_km is not None:
-            places = [p for p in places if haversine_km(origin, p.location) <= max_km]
-            if not places:
-                return None, ""
+        places, cum_weights, total = self._venue_draw(subtype, origin, max_km)
+        if not places:
+            return None, ""
         if len(places) == 1:
             return places[0].location, places[0].place_id
-        scale = params.CITY_PARAMS.get("organic_poi_proximity_scale_km", 3.0) or 1.0
-        weights = [math.exp(-haversine_km(origin, p.location) / scale) for p in places]
-        if sum(weights) <= 0:
+        if total <= 0:
             place = rng.choice(places)
         else:
-            place = rng.choices(places, weights=weights, k=1)[0]
+            place = rng.choices(places, cum_weights=cum_weights, k=1)[0]
         return place.location, place.place_id
+
+    def _venue_draw(self, subtype, origin, max_km):
+        """``(places, cumulative weights, total weight)`` of the organic venue
+        draw for ``subtype`` from ``origin`` within ``max_km``, memoised."""
+        key = (subtype, tuple(origin), max_km)
+        draw = self._venue_draws.get(key)
+        if draw is None:
+            places = self._pois_by_subtype.get(subtype) or []
+            if max_km is not None:
+                places = [p for p in places if haversine_km(origin, p.location) <= max_km]
+            scale = params.CITY_PARAMS.get("organic_poi_proximity_scale_km", 3.0) or 1.0
+            weights = [math.exp(-haversine_km(origin, p.location) / scale) for p in places]
+            draw = self._venue_draws[key] = (places, array("d", accumulate(weights)), sum(weights))
+        return draw
+
+    def expected_activity_utility(self, agent, subtype, origin, max_km=None):
+        """The activity benefit the agent can expect from an organic outing of
+        ``subtype`` from ``origin``: :meth:`realised_activity_utility` averaged
+        over the venues it would choose between on its own, each weighted by
+        the probability :meth:`sample_poi` picks it. Only the taste match
+        varies across venues, so this is the venue-independent benefit plus the
+        match bonus times the chance of landing on a match."""
+        base = self.realised_activity_utility(agent, subtype, "")
+        if not self._pois_by_subtype.get(subtype):
+            return base
+        places, cum_weights, total = self._venue_draw(subtype, origin, max_km)
+        if not places:
+            return base
+        bonus = [self.taste_bonus(agent, p.place_id) for p in places]
+        if total <= 0:
+            return base + sum(bonus) / len(bonus)
+        weights = [c - p for c, p in zip(cum_weights, [0.0, *cum_weights[:-1]])]
+        return base + sum(w * b for w, b in zip(weights, bonus)) / total
 
     # ── Persona loading ──────────────────────────────────────────────────────
 
@@ -1661,18 +1702,22 @@ class Simulation:
         probs = self.mode_choice_probabilities(agent, outcomes)
         return gen_cost_weight * sum(p * outcomes[m]["gen_cost"] for m, p in probs.items()) / denom
 
-    def planned_round_trip_disutility(self, agent, origin, destination, subtype,
-                                      gen_cost_weight=1.0):
-        """Expected travel cost of going to ``destination`` and back home, in
-        utility units. None when a leg has no permitted mode.
+    def planned_trip_disutility(self, agent, origin, destination, subtype,
+                                gen_cost_weight=1.0):
+        """Expected travel cost of getting from ``origin`` to ``destination``,
+        in utility units. None when no permitted mode makes the leg.
 
         This is the paper's C in U = V - C: the generalised cost (time x value
-        of time + money) of reaching and returning from the activity, which is
-        also exactly what the welfare metric charges a realised trip
-        (``activity_utility - gen_cost / gen_cost_denominator``). It is made
-        mode-aware by weighting each mode's cost by the probability this agent
-        takes it: a carless core resident pays the walk, a suburban driver the
-        drive.
+        of time + money) of reaching the activity, which is exactly what the
+        welfare metric charges a realised leisure trip (``activity_utility -
+        gen_cost / gen_cost_denominator``, on the leg to the venue). The way
+        home is not charged to the outing: a worker heads home after work
+        whether or not they stop somewhere first, so pricing it in made every
+        after-work outing carry the commute and kept employed agents home
+        (NYC: 0.03 outings a day, against 0.39 for agents leaving from home).
+        It is made mode-aware by weighting each mode's cost by the probability
+        this agent takes it: a carless core resident pays the walk, a suburban
+        driver the drive.
 
         Why cost and not the whole travel utility: the travel utility also
         carries the mode constants, which a choice model identifies only
@@ -1682,17 +1727,10 @@ class Simulation:
         agent expects to take, through the probabilities. And why not the
         logsum: at this model's utility scale its choice-value term (up to ln 3
         ~ 1.1 per leg) is as large as the travel cost itself, and no realised
-        trip is ever credited with it. See Agent._price_round_trip.
+        trip is ever credited with it. See Agent._price_trip.
         """
-        out = self._leg_expected_cost(agent, origin, destination,
-                                      _Stop("leisure", subtype, False), gen_cost_weight)
-        if out is None:
-            return None
-        back = self._leg_expected_cost(agent, destination, agent.home,
-                                       _Stop("home", "", True), gen_cost_weight)
-        if back is None:
-            return None
-        return out + back
+        return self._leg_expected_cost(agent, origin, destination,
+                                       _Stop("leisure", subtype, False), gen_cost_weight)
 
     def reach_limit_km(self, agent):
         """Straight-line bound on how far the agent can travel at all, or None
@@ -2053,6 +2091,16 @@ class Simulation:
                                 break
                         if feedback_trip is not None:
                             self._record_recommendation_feedback(agent, feedback_trip, fp)
+                    if current_activity.type == "leisure":
+                        # Every outing, recommended or organic, updates what the
+                        # agent considers a usual outing of its kind. After the
+                        # feedback above, so a recommendation is judged against
+                        # the usual as it stood before it.
+                        for tr in reversed(agent.trips):
+                            if tr.purpose == "leisure":
+                                if tr.place_id == current_activity.place_id:
+                                    agent.record_outing(tr)
+                                break
                     next_activity = agent.schedule[agent.current_activity_index + 1]
                     if current_activity.location != next_activity.location:
                         departures.append((agent, current_activity, next_activity))

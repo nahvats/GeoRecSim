@@ -132,6 +132,11 @@ class Agent:
         self.last_eta = 0.0
         self.accepted_recommendation_count = 0
         self.daily_recommendations = {}
+        # The agent's usual outing of each leisure subtype: a running average of
+        # the activity benefit its outings gave it, against which it judges a
+        # recommended venue (evaluate_recommendation_feedback). Seeded in
+        # plan_day the first evening the agent weighs each subtype.
+        self.outing_reference = {}
         # Latent taste per family ({"dining": ("thai", "deli"), ...}), assigned
         # by the Simulation from the catalog's own supply mix. Invisible to the
         # recommenders: it moves this agent's realised utility, and the platform
@@ -576,18 +581,20 @@ class Agent:
             adjustment += sb["trend_bonus"] * (bc["trend_susceptibility"] - 0.5)
         return adjustment
 
-    def _price_round_trip(self, env, origin, destination, subtype):
-        """Expected disutility of going to ``destination`` and home again, or
-        None when the agent has no way to make one of the two legs.
+    def _price_trip(self, env, origin, destination, subtype):
+        """Expected disutility of getting from ``origin`` to ``destination``,
+        or None when the agent has no way to make the trip.
 
-        Each leg is priced at the generalised cost this agent can expect on it
-        — time x value of time + money, the paper's C — with each mode's cost
+        Only the leg to the venue is charged, not the way home (see
+        Simulation.planned_trip_disutility). It is priced at the generalised
+        cost this agent can expect on it — time x value of time + money, the
+        paper's C — with each mode's cost
         weighted by the probability that the agent takes that mode under its
         own decision rule. So a venue costs what getting there will actually
         cost THIS agent: a 600 m walk is cheap for a carless core resident, and
         a suburban driver pays the drive. (Not the whole travel utility, whose
         mode constants have no meaningful level, and not the logsum: see
-        Simulation.planned_round_trip_disutility.)
+        Simulation.planned_trip_disutility.)
 
         Still the ex-ante view: priced at free-flow road speed, whereas the
         realised trip is charged under the congestion it meets, which is what
@@ -600,12 +607,27 @@ class Agent:
         the same cost model the agent used to rank the evening's options, so it
         values travel the same way whether planning or responding."
         """
+        return env.planned_trip_disutility(
+            self, origin, destination, subtype, gen_cost_weight=self._trip_cost_weight(subtype))
+
+    def _trip_cost_weight(self, subtype):
+        """How heavily this agent perceives travel cost on a ``subtype`` outing:
+        its trip-burden multiplier, eased for outdoor activities if it does not
+        mind walking."""
         pp = params.PARTICIPATION_PARAMS
         weight = self._trip_disutility_multiplier()
         if subtype in {"park", "workout_or_run"} and self.walk_tolerance_min >= pp["outdoor_walk_tol_threshold"]:
             weight *= pp["outdoor_walk_tol_discount"]
-        return env.planned_round_trip_disutility(
-            self, origin, destination, subtype, gen_cost_weight=weight)
+        return weight
+
+    def record_outing(self, trip):
+        """Fold a finished leisure outing, recommended or organic, into the
+        agent's usual outing of that subtype."""
+        subtype = trip.purpose_subtype
+        value = trip.activity_utility
+        usual = self.outing_reference.get(subtype)
+        alpha = params.FEEDBACK_PARAMS["outing_reference_smoothing"]
+        self.outing_reference[subtype] = value if usual is None else (1.0 - alpha) * usual + alpha * value
 
     def _trip_disutility_multiplier(self):
         """Scale expected travel burden from psychological and survey factors."""
@@ -704,9 +726,9 @@ class Agent:
               + memory term (accepted count),
         clamped to [eta_min, eta_max]. See ``params.SIMPLIFIED_ETA_PARAMS``.
 
-        ``delta_cost`` is Eq. 2's dC_it: the offered venue's expected round-trip
+        ``delta_cost`` is Eq. 2's dC_it: the offered venue's expected trip
         disutility minus that of the venue the agent had already picked, both
-        from :meth:`_price_round_trip`. Positive means the offer costs more
+        from :meth:`_price_trip`. Positive means the offer costs more
         travel, which lowers acceptance; negative means it is closer than the
         agent's own choice, which raises it. Defaults to 0.0 so callers with no
         alternative to compare against are unaffected.
@@ -730,17 +752,31 @@ class Agent:
     # ── Feedback ─────────────────────────────────────────────────────────────
 
     def evaluate_recommendation_feedback(self, trip, env, rng):
-        """Generate like/dislike feedback for accepted recommendations."""
+        """Like or dislike an accepted recommendation, by how the outing
+        compared with this agent's usual outing of that kind.
+
+        ``surprise`` is the activity benefit the venue gave minus the agent's
+        running average for the subtype (``outing_reference``). What does not
+        depend on the venue (the subtype's base benefit, the agent's
+        motivations) is in both and cancels, so the like reflects the venue
+        itself: whether it matched the agent's taste, measured against how
+        often its outings of that kind usually do. Consumers rate an experience
+        against what they expected of it (expectation-disconfirmation), and
+        they rate the place, not the journey there: travel cost is the welfare
+        metric's and the gates' business, not the review's.
+
+        The survey-measured dispositions to rate platforms favourably or not
+        (trust, feedback-loop strength, autonomy, algorithmic awareness) and the
+        weather still shift the like, as a personal bias around the comparison.
+        """
         if trip.purpose != "leisure" or not trip.accepted_recommendation:
             return 0, 0.0
 
         fp = params.FEEDBACK_PARAMS
         sp = params.SURVEY_BEHAVIOR_PARAMS["feedback_shift"]
         subtype = trip.purpose_subtype
-        pref_fit = self.leisure_preferences.get(subtype, 1.0) - 1.0
-        intrinsic = self.motivation_weights["intrinsic"]
-        escape = self.motivation_weights["escape"]
-        travel_affinity = self.attitudes["travel_affinity"]
+        value = trip.activity_utility
+        surprise = value - self.outing_reference.get(subtype, value)
 
         context_term = 0.0
         weather = env.context.get("weather", "fair")
@@ -749,13 +785,8 @@ class Agent:
         if env.context.get("social_norms") == "green" and subtype == "park":
             context_term += fp["green_norm_park_bonus"]
 
-        experience_term = fp["experience_activity_weight"] * trip.activity_utility + fp["experience_travel_weight"] * trip.travel_utility
         score = (
-            experience_term
-            + fp["pref_fit_weight"] * pref_fit
-            + fp["intrinsic_weight"] * intrinsic
-            + fp["escape_weight"] * escape
-            + fp["travel_affinity_weight"] * travel_affinity
+            fp["surprise_weight"] * surprise
             + sp["trust_platforms"] * (self.latent_variables["trust_platforms"] - 0.5)
             + sp["feedback_loop_strength"] * (self.behavioral_coefficients["feedback_loop_strength"] - 0.5)
             - sp["autonomy_preference"] * (self.latent_variables["autonomy_preference"] - 0.5)
@@ -888,7 +919,7 @@ class Agent:
             if leisure_start + leisure_duration > open_end:
                 continue
 
-            expected_trip_disutility = self._price_round_trip(
+            expected_trip_disutility = self._price_trip(
                 env, origin_after_work, desired_location, subtype
             )
             if expected_trip_disutility is None:
@@ -936,6 +967,17 @@ class Agent:
                     "trip_disutility": expected_trip_disutility,
                 }
             )
+
+        # Seed the usual outing of each subtype the first evening the agent
+        # weighs it, with what an outing of that kind near it is worth on
+        # average: a resident already knows roughly what a night out nearby is
+        # like. An average over the venues it would pick between, not tonight's
+        # one venue, so the seed is neither lucky nor unlucky.
+        reach = env.reach_limit_km(self)
+        for o in options:
+            if o["subtype"] not in self.outing_reference:
+                self.outing_reference[o["subtype"]] = env.expected_activity_utility(
+                    self, o["subtype"], origin_after_work, max_km=reach)
 
         chosen = None
         do_leisure = False
@@ -1000,7 +1042,7 @@ class Agent:
             # outright: eta stays 0 and no acceptance draw is made.
             offered_cost = None
             if best_rec is not None:
-                offered_cost = self._price_round_trip(
+                offered_cost = self._price_trip(
                     env, origin_after_work, best_rec.place.location, subtype)
             if offered_cost is not None:
                 # Eq. 2's dC_it. The agent's own pick was already priced when

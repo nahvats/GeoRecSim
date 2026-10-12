@@ -61,7 +61,7 @@ SIMPLIFIED_ETA_PARAMS: dict = {
     # Quality term: delta_qual = quality_weight * (score - 0.5)
     "quality_weight": 0.18,
     # Extra-travel term: delta_cost = -beta_delta_cost * (C_offered - C_own),
-    # both priced by Agent._price_round_trip. This is Eq. 2's -beta_D * dC_it:
+    # both priced by Agent._price_trip. This is Eq. 2's -beta_D * dC_it:
     # how much further the offered venue is than the one the agent had already
     # chosen for itself, which platforms display beside every result.
     #
@@ -694,7 +694,7 @@ PARTICIPATION_PARAMS: dict = {
     "min_net_utility": -0.15,
     # (expected_trip_disutility_per_km, the flat 0.12/km a venue used to be
     # priced at, is gone: venues are priced by the mode-choice logsum — see
-    # Agent._price_round_trip.)
+    # Agent._price_trip.)
     "outdoor_walk_tol_discount": 0.92,
     "outdoor_walk_tol_threshold": 30,
     "activity_intrinsic_coeff": 0.35,
@@ -720,12 +720,17 @@ PARTICIPATION_PARAMS: dict = {
 # ── Feedback / RS learning ───────────────────────────────────────────────────
 
 FEEDBACK_PARAMS: dict = {
-    "experience_activity_weight": 0.85,
-    "experience_travel_weight": 0.25,
-    "pref_fit_weight": 0.30,
-    "intrinsic_weight": 0.20,
-    "escape_weight": 0.10,
-    "travel_affinity_weight": 0.15,
+    # Like/dislike = sigmoid(sigmoid_scale * score), with score led by
+    # surprise_weight * (the venue's activity benefit - the agent's usual for
+    # that subtype); see Agent.evaluate_recommendation_feedback. Only the taste
+    # match (TASTE_PARAMS["match_bonus"], 0.15) varies by venue, so at 4.0 a
+    # match is liked about 18 points more often than a miss.
+    # Not estimated from data: the survey has no rating question.
+    "surprise_weight": 4.0,
+    # Weight of the newest outing in the running average of the usual outing
+    # (exponential smoothing), as for the agents' other reference points
+    # (SIM_DEFAULTS["reference_point_smoothing"]).
+    "outing_reference_smoothing": 0.2,
     "rain_heat_outdoor_penalty": -0.25,
     "green_norm_park_bonus": 0.10,
     "sigmoid_scale": 1.25,
@@ -1221,4 +1226,14 @@ SIM_DEFAULTS: dict = {
     "seed": 42,
     "time_step": 5,
     "reference_point_smoothing": 0.2,   # alpha in exponential smoothing
+}
+
+# Default welfare-gate thresholds: the optima of the gating threshold study
+# (gating_study/, 2026-10-12: Personalized, 8 metros x 2,000 agents x 30 days x
+# 10 seeds). PUP peaks at alpha 0.3 (utility 0.293, 5% abstention; flat from 0.1
+# to 0.6). RM epsilon is the 75th percentile of Standard RS's expected regret, the
+# best of the calibrated grid (0.288, 8% abstention; p80 is within 0.001).
+WELFARE_GATE_DEFAULTS: dict = {
+    "pup_alpha": 0.3,
+    "rm_epsilon": 0.2550,
 }

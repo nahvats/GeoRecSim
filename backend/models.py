@@ -7,6 +7,8 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from welfare_rs import params
+
 from service import (DEFAULT_CITY, MAX_RECOMMENDERS, MAX_SEEDS, RESERVED_LABELS,
                      TREATMENTS, RecommenderSpec, RunConfig, WELFARE_GATES)
 
@@ -32,8 +34,8 @@ class RecommenderSpecRequest(BaseModel):
     learning_rate: float = Field(0.12, ge=0.0, le=1.0)
     #: "" | "pup" | "rm" | "pup_rm" — the welfare gate applied on top.
     welfare_gate: str = ""
-    pup_alpha: float = Field(0.6, ge=0.0, le=1.0)
-    rm_epsilon: float = Field(0.3, ge=0.0, le=1.5)
+    pup_alpha: float = Field(params.WELFARE_GATE_DEFAULTS["pup_alpha"], ge=0.0, le=1.0)
+    rm_epsilon: float = Field(params.WELFARE_GATE_DEFAULTS["rm_epsilon"], ge=0.0, le=1.5)
     random_ranking: bool = False
 
     @field_validator("welfare_gate")
@@ -106,8 +108,8 @@ class RunRequest(BaseModel):
     conditions: List[str] = Field(default_factory=list)
     treatment: Optional[str] = None
     use_real_pois: bool = True
-    pup_alpha: float = Field(0.6, ge=0.0, le=1.0)
-    rm_epsilon: float = Field(0.3, ge=0.0, le=1.5)
+    pup_alpha: float = Field(params.WELFARE_GATE_DEFAULTS["pup_alpha"], ge=0.0, le=1.0)
+    rm_epsilon: float = Field(params.WELFARE_GATE_DEFAULTS["rm_epsilon"], ge=0.0, le=1.5)
 
     @field_validator("recommenders")
     @classmethod

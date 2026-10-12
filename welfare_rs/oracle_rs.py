@@ -13,8 +13,8 @@ Mapped onto this model, for the subtype the agent has already chosen:
 ``V_ik``  :meth:`Simulation.realised_activity_utility` — the benefit the trip
           is credited with on arrival, latent taste match included. The other
           recommenders cannot observe the taste term; the oracle reads it.
-``C_ik``  :meth:`Agent._price_round_trip` — the agent's own expected cost of
-          the round trip: time x its value of time + money, each mode weighted
+``C_ik``  :meth:`Agent._price_trip` — the agent's own expected cost of
+          getting there: time x its value of time + money, each mode weighted
           by the probability this agent takes it under its own decision rule,
           scaled by its trip-burden sensitivity. The same cost model the agent
           ranks its own options with and prices eta's dC with.
@@ -65,8 +65,8 @@ class OracleRecommender(RecommenderSystem):
 
     def true_net_utility(self, agent, user: UserContext, leisure_subtype: str, place):
         """``(U, V, C)`` for sending ``agent`` to ``place``, or None when no mode
-        it may use makes the round trip."""
-        cost = agent._price_round_trip(self.env, user.location, place.location, leisure_subtype)
+        it may use makes the trip."""
+        cost = agent._price_trip(self.env, user.location, place.location, leisure_subtype)
         if cost is None:
             return None
         value = self.env.realised_activity_utility(agent, leisure_subtype, place.place_id)

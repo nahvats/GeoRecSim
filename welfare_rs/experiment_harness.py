@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from . import params
+
 
 # ── Welfare metrics ──────────────────────────────────────────────────────────
 
@@ -136,8 +138,6 @@ def leisure_net_utility(trip) -> float:
     same ``gen_cost_denominator`` the simulation uses when travel cost enters mode
     utility — so V and C live on one scale, matching the paper's Eq. 3.
     """
-    from . import params
-
     denom = params.UTILITY_WEIGHTS.get("gen_cost_denominator", 8.0) or 1.0
     return float(trip.activity_utility - trip.gen_cost / denom)
 
@@ -261,8 +261,8 @@ class TreatmentConfig:
 
     name: str
     welfare_mode: str  # "standard", "pup", "rm", "pup_rm", "oracle", "no_rs"
-    pup_alpha: float = 0.6
-    rm_epsilon: float = 0.3
+    pup_alpha: float = params.WELFARE_GATE_DEFAULTS["pup_alpha"]
+    rm_epsilon: float = params.WELFARE_GATE_DEFAULTS["rm_epsilon"]
     description: str = ""
 
 

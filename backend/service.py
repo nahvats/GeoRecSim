@@ -12,15 +12,15 @@ they do and don't share:
 * Threads wouldn't help — the agent loop is pure-Python (GIL-bound). Separate
   processes each get their own module globals, so there is no cross-task
   contention.
-* The metro graph is *not* shared: the pool uses 'spawn', so each worker
-  unpickles its own copy of the drive graph and of the core walk and bike
-  graphs (tens of MB each on disk, a few hundred resident). The parent
-  pre-builds it once so no worker downloads from Overpass or races to write the
-  warm pickle, and after the first read the file is served from page cache. A
-  worker caches the network process-globally and reuses it across its tasks.
+* Each simulation runs in a child process of its own, forked from a pool
+  worker, and loads its own copy of the metro network (0.8-3.2 GB resident).
+  The child exits when the simulation ends, so every byte goes back to the OS,
+  and it saves its own result to disk (see ``_run_one`` and the checkpoint
+  section). The web process keeps no map data in memory.
 * The routing matrices (welfare_rs.routing_matrix, 3-35 GB per metro) ARE shared:
-  they are opened ``mmap_mode="r"``, so every worker reads one page-cache copy.
-  That is what makes a wide fan-out affordable.
+  they are opened ``mmap_mode="r"``, so every simulation reads one page-cache copy.
+* Memory, not cores, is what limits how many simulations run at once: each
+  reserves its estimated peak before it starts (``ResourceGovernor``).
 
 Table 2 pairs a recommender against No RS agent-by-agent, which would otherwise
 force both runs into one process. Instead each task returns its per-agent eval-day
@@ -33,8 +33,12 @@ the **last (evaluation) day's** leisure trips per run, then aggregated across se
 
 from __future__ import annotations
 
+import functools
+import gzip
 import hashlib
+import json
 import math
+import pickle
 import os
 import warnings
 import sys
@@ -48,6 +52,7 @@ import multiprocessing as mp
 import queue
 import threading
 import time
+import traceback
 from concurrent.futures import (FIRST_COMPLETED, ProcessPoolExecutor,
                                 ThreadPoolExecutor, wait)
 from concurrent.futures.process import BrokenProcessPool
@@ -61,6 +66,7 @@ from welfare_rs import params, routing_matrix
 from welfare_rs.datasource import get_datasource
 from welfare_rs.experiment_harness import (
     eval_day_leisure_utilities,
+    leisure_net_utility,
     table1_metrics,
     table2_from_utilities,
 )
@@ -96,6 +102,11 @@ MAX_RECOMMENDERS = 5
 #: Ceiling on points in the spatial welfare map. Well past what a hexbin can
 #: resolve, and it keeps the run payload bounded regardless of population.
 WELFARE_MAP_MAX_POINTS = 20000
+
+#: Where every finished study is saved (see ``_save_study_record``). Studies
+#: are otherwise held only in memory, so a service restart or LRU eviction
+#: would lose the per-agent detail that later figures are made from.
+STUDY_RECORD_DIR = os.path.join(params.GEO_PARAMS["cache_dir"], "studies")
 
 #: Deprecated fixed vocabulary, kept so saved API calls still resolve.
 TREATMENTS = ["No RS", "Standard RS", "PUP", "RM", "PUP+RM"]
@@ -163,13 +174,45 @@ def _worker_count(n_tasks: int) -> int:
 # studies get half the cores each and widen back out as one finishes.
 MAX_STUDIES = int(os.environ.get("WELFARE_RS_MAX_STUDIES", "0") or 0) or 10
 
-# RAM headroom kept free. Each simulation process holds its own copy of the
-# metro graph (a few hundred MB); the routing matrices are memmapped, so they
-# cost one shared page-cache copy however many workers there are. When headroom
-# falls below this the governor stops STARTING tasks — running ones finish
-# untouched, so the study slows rather than dying, and an OOM kill (which would
-# take the whole service, every study with it) is avoided.
+# Memory the simulations may reserve between them, in GB. Leaves the web
+# process (which holds every running study's per-run results, without their map
+# data) and the box's other work room under the service's MemoryMax.
+MEMORY_BUDGET_GB = float(os.environ.get("WELFARE_RS_MEMORY_BUDGET_GB", "0") or 0) or 160.0
+
+# Last guard: no simulation starts while the box has less than this available,
+# whatever the reservations say. Catches memory used outside the service.
 MIN_FREE_RAM_GB = float(os.environ.get("WELFARE_RS_MIN_FREE_RAM_GB", "24"))
+
+# Ceiling on Oracle simulations at once, across all studies. Oracle is the
+# slowest arm, so its tasks start first; without a ceiling they would take the
+# whole memory budget and leave the other arms queueing for hours.
+MAX_ORACLE_TASKS = int(os.environ.get("WELFARE_RS_MAX_ORACLE_TASKS", "0") or 0) or MAX_WORKERS
+
+# A simulation whose process dies (killed for memory, or crashed) is retried
+# this many times in all before its study fails.
+MAX_TASK_ATTEMPTS = 3
+
+
+# Peak memory of one simulation: the metro network, plus a cost per agent once
+# the run is set up, plus growth per agent-day (map data and the capped route
+# memos). Measured 2026-10-12 with 2,500 agents over 15 days (anonymous memory
+# of the simulation process); metros not measured take the largest values.
+# Oracle and the other arms grow alike now that the route memos are capped.
+_NETWORK_GB = {"la": 3.0, "nyc": 0.8, "houston": 3.2, "chicago": 2.9}
+_PER_1000_AGENTS_GB = {"la": 0.8, "nyc": 0.5, "houston": 0.6, "chicago": 0.9}
+_GROWTH_GB_PER_1000_AGENT_DAYS = {"oracle": 0.04, "other": 0.04}
+_MEMORY_MARGIN = 1.25        # headroom on every estimate
+
+
+def _task_memory_gb(cfg: dict, condition: str) -> float:
+    """Expected peak memory of one simulation of this study, in GB, with margin."""
+    city = cfg["city"]
+    agents_k = int(cfg["num_agents"]) / 1000.0
+    growth = _GROWTH_GB_PER_1000_AGENT_DAYS["oracle" if condition == ORACLE else "other"]
+    network = _NETWORK_GB.get(city, max(_NETWORK_GB.values()))
+    per_agent = _PER_1000_AGENTS_GB.get(city, max(_PER_1000_AGENTS_GB.values()))
+    peak = network + agents_k * (per_agent + growth * int(cfg["num_days"]))
+    return _MEMORY_MARGIN * peak
 
 
 def _cgroup_headroom() -> Optional[int]:
@@ -211,28 +254,41 @@ def _available_ram() -> Optional[int]:
     return min(headrooms) if headrooms else None
 
 
+@dataclass(frozen=True)
+class TaskCost:
+    """What one simulation holds while it runs."""
+    memory_gb: float
+    oracle: bool
+
+
 class ResourceGovernor:
-    """Splits the CPU budget evenly across the studies running right now.
+    """Decides which simulation may START, across every running study.
 
-    One shared process pool serves every study; this decides who may START a
-    task in it. Each running study gets ``MAX_WORKERS // n_studies`` slots (at
-    least one), recomputed on every acquire and release — so a study widens as
-    others finish and narrows as they start, with nothing resized or restarted
-    and no study ever starved.
+    One shared process pool serves every study. A simulation starts only if all
+    of these hold, and keeps its share until it ends:
 
-    Symmetric by construction: the quota depends only on how many studies are
-    running, never on which, how big, or who asked first. A study that wants
-    more slots than its share simply waits, and the wait is released the moment
-    another study finishes a task or exits.
-
-    The RAM floor is checked on the same path, so memory pressure throttles
-    task STARTS rather than killing the service.
+    * CPU: each running study gets ``MAX_WORKERS // n_studies`` slots (at least
+      one), recomputed on every start and finish, so a study widens as others
+      finish and narrows as they start, and no study is starved.
+    * Memory: the simulation reserves its expected PEAK memory
+      (``_task_memory_gb``), and all reservations must fit in
+      ``MEMORY_BUDGET_GB``. Reserving the peak is the point. A simulation starts
+      at ~0.1 GB and reaches several GB minutes later, so a check of free memory
+      at start let 56 of them start together and then outgrow the box together
+      (the service was killed for memory on 2026-10-11).
+    * Oracle: at most ``MAX_ORACLE_TASKS`` Oracle simulations at once.
+    * The box must still have ``MIN_FREE_RAM_GB`` available.
     """
 
-    def __init__(self, total_slots: int, min_free_ram_bytes: int):
+    def __init__(self, total_slots: int, memory_budget_gb: float, max_oracle: int,
+                 min_free_ram_bytes: int):
         self._total = max(1, total_slots)
+        self._memory_budget = memory_budget_gb
+        self._max_oracle = max(1, max_oracle)
         self._min_free_ram = max(0, min_free_ram_bytes)
         self._held: Dict[str, int] = {}
+        self._reserved_gb = 0.0
+        self._oracles = 0
         self._cond = threading.Condition()
         self._ram_waits = 0
 
@@ -249,58 +305,42 @@ class ResourceGovernor:
     def _quota_locked(self) -> int:
         return max(1, self._total // max(1, len(self._held)))
 
-    def quota(self) -> int:
-        with self._cond:
-            return self._quota_locked()
-
     def _ram_ok(self) -> bool:
         if not self._min_free_ram:
             return True
         free = _available_ram()
         return free is None or free >= self._min_free_ram
 
-    def acquire(self, run_id: str, should_stop=None) -> bool:
-        """Take one slot, blocking until the study's share allows it.
-
-        Returns False if ``should_stop()`` went true while waiting, so a
-        cancelled study stops queueing more work instead of finishing its grid.
-        """
-        with self._cond:
-            while True:
-                if should_stop is not None and should_stop():
-                    return False
-                held = self._held.get(run_id, 0)
-                in_flight = sum(self._held.values())
-                if held < self._quota_locked() and in_flight < self._total:
-                    if self._ram_ok():
-                        self._held[run_id] = held + 1
-                        return True
-                    self._ram_waits += 1
-                # Timed wait: a slot freeing notifies, but RAM recovering does
-                # not, so the wait has to expire and re-check on its own.
-                self._cond.wait(timeout=2.0)
-
-    def try_acquire(self, run_id: str) -> bool:
-        """Take a slot if one is free right now; never block.
-
-        The top-up path must not block: a study reaps its own completed tasks,
-        so a blocking acquire there would wait for a slot that only the code
-        after it can release. Blocking acquire is for the idle case only.
-        """
+    def try_acquire(self, run_id: str, cost: TaskCost) -> bool:
+        """Take a slot and reserve ``cost`` if everything fits right now; never block."""
         with self._cond:
             held = self._held.get(run_id, 0)
-            if (held < self._quota_locked()
-                    and sum(self._held.values()) < self._total
-                    and self._ram_ok()):
-                self._held[run_id] = held + 1
-                return True
-            return False
+            if held >= self._quota_locked() or sum(self._held.values()) >= self._total:
+                return False
+            if self._reserved_gb + cost.memory_gb > self._memory_budget:
+                return False
+            if cost.oracle and self._oracles >= self._max_oracle:
+                return False
+            if not self._ram_ok():
+                self._ram_waits += 1
+                return False
+            self._held[run_id] = held + 1
+            self._reserved_gb += cost.memory_gb
+            self._oracles += cost.oracle
+            return True
 
-    def release(self, run_id: str) -> None:
+    def release(self, run_id: str, cost: TaskCost) -> None:
         with self._cond:
             if self._held.get(run_id):
                 self._held[run_id] -= 1
+            self._reserved_gb = max(0.0, self._reserved_gb - cost.memory_gb)
+            self._oracles = max(0, self._oracles - cost.oracle)
             self._cond.notify_all()
+
+    def wait(self, timeout: float) -> None:
+        """Sleep until something is released, or ``timeout`` seconds pass."""
+        with self._cond:
+            self._cond.wait(timeout=timeout)
 
     def snapshot(self) -> dict:
         with self._cond:
@@ -311,19 +351,81 @@ class ResourceGovernor:
                 "slots_per_study": self._quota_locked(),
                 "slots_in_use": sum(self._held.values()),
                 "per_study": dict(self._held),
+                "memory_budget_gb": self._memory_budget,
+                "memory_reserved_gb": round(self._reserved_gb, 1),
+                "oracle_tasks": self._oracles,
                 "ram_free_gb": round(free / 1e9, 1) if free is not None else None,
                 "ram_floor_gb": round(self._min_free_ram / 1e9, 1),
                 "ram_throttle_events": self._ram_waits,
             }
 
 
-GOVERNOR = ResourceGovernor(MAX_WORKERS, int(MIN_FREE_RAM_GB * 1e9))
+GOVERNOR = ResourceGovernor(MAX_WORKERS, MEMORY_BUDGET_GB, MAX_ORACLE_TASKS,
+                            int(MIN_FREE_RAM_GB * 1e9))
 
-# ONE pool for the whole box, not one per study. Per-study pools would each
-# spawn their own processes, so N studies would hold N copies of every metro
-# graph and idle processes would linger after a study narrowed. Sharing keeps
-# the process count at MAX_WORKERS no matter how many studies are running; the
-# governor decides which study may use them.
+
+# ── Simulation checkpoints ───────────────────────────────────────────────────
+#
+# Every simulation saves its own result as soon as it finishes, in two files
+# under TASK_RESULT_DIR/<run id>/: the map data (by far the largest part, ~0.2 GB
+# pickled for 2,500 agents x 60 days) and everything else. The web process only
+# ever loads the second: the map data is read from disk when a map is opened.
+# A study that dies part-way loses only the simulations still running, since
+# resubmitting the same config (same run id) reloads the finished ones.
+
+TASK_RESULT_DIR = os.path.join(params.GEO_PARAMS["cache_dir"], "study_tasks")
+
+
+def _task_checkpoint(run_id: str, seed: int, condition: str) -> str:
+    """Path prefix of one simulation's checkpoint files."""
+    name = hashlib.sha1(condition.encode()).hexdigest()[:12]
+    return os.path.join(TASK_RESULT_DIR, run_id, f"seed{seed}_{name}")
+
+
+def _write_atomic(path: str, obj) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as fh:
+        pickle.dump(obj, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)  # never leave a half-written file under the final name
+
+
+def _save_task_result(checkpoint: str, res: dict) -> dict:
+    """Save a finished simulation; return it without its map data.
+
+    The map data is written first, so the results file existing means both do.
+    """
+    os.makedirs(os.path.dirname(checkpoint), exist_ok=True)
+    _write_atomic(checkpoint + ".viz.pkl", res["viz"])
+    light = {k: v for k, v in res.items() if k != "viz"}
+    light["time_span"] = res["viz"]["time_span"]
+    light["viz_file"] = checkpoint + ".viz.pkl"
+    _write_atomic(checkpoint + ".pkl", light)
+    return light
+
+
+def _load_task_result(checkpoint: str, seed: int, condition: str) -> Optional[dict]:
+    """A finished simulation's result (without map data), or None."""
+    if not os.path.exists(checkpoint + ".pkl"):
+        return None
+    with open(checkpoint + ".pkl", "rb") as fh:
+        res = pickle.load(fh)
+    return res if (res["seed"], res["condition"]) == (seed, condition) else None
+
+
+@functools.lru_cache(maxsize=4)
+def _load_seed_viz(path: str, seed: int) -> "SeedViz":
+    """One simulation's map data, read from its checkpoint (the few most
+    recently viewed are kept)."""
+    with open(path, "rb") as fh:
+        data = pickle.load(fh)
+    return SeedViz(seed=seed, merged={int(k): v for k, v in data["merged"].items()},
+                   trip_index=data["trip_index"], time_span=data["time_span"])
+
+
+# ONE pool for the whole box, not one per study, so the process count stays at
+# MAX_WORKERS however many studies run; the governor decides which study may
+# use it. Its workers only wait: each simulation runs in a child process of its
+# own (see _run_one).
 _POOL_LOCK = threading.Lock()
 _POOL = None
 
@@ -371,8 +473,8 @@ class RecommenderSpec:
     popularity_gamma: float = 1.0
     learning_rate: float = 0.12
     welfare_gate: str = ""          # "" | "pup" | "rm" | "pup_rm"
-    pup_alpha: float = 0.6
-    rm_epsilon: float = 0.3
+    pup_alpha: float = params.WELFARE_GATE_DEFAULTS["pup_alpha"]
+    rm_epsilon: float = params.WELFARE_GATE_DEFAULTS["rm_epsilon"]
     random_ranking: bool = False
     #: The perfect-knowledge upper bound (welfare_rs.oracle_rs): ranks by each
     #: agent's true net utility, so every weight, random_ranking and the
@@ -493,7 +595,10 @@ class Run:
     config: RunConfig
     seeds: List[int]
     conditions: List[str]                        # No RS first, then recommenders
-    per_condition: Dict[str, Dict[int, SeedViz]]  # condition -> seed -> geometry
+    # condition -> seed -> the map data's checkpoint file, and its time span.
+    # The data itself stays on disk until a map asks for it (see viz()).
+    viz_files: Dict[str, Dict[int, str]]
+    time_spans: Dict[str, Dict[int, int]]
     pois_by_seed: Dict[int, List[dict]]          # condition-independent
     table1: List[dict]            # one row per condition (No RS first)
     table2: List[dict]            # one row per recommender, paired vs No RS
@@ -531,8 +636,8 @@ class Run:
             "default_condition": self.default_condition(),
             # {condition: {seed: span}} — the scrubber's extent depends on both.
             "time_spans": {
-                cond: {str(s): sv.time_span for s, sv in by_seed.items()}
-                for cond, by_seed in self.per_condition.items()
+                cond: {str(s): span for s, span in by_seed.items()}
+                for cond, by_seed in self.time_spans.items()
             },
             "table1": self.table1,
             "table2": self.table2,
@@ -554,18 +659,22 @@ class Run:
             "duration_sec": self.duration_sec,
         }
 
+    def has_condition(self, condition: Optional[str]) -> bool:
+        return condition in self.viz_files
+
     def viz(self, condition: Optional[str], seed: Optional[int]) -> Optional[SeedViz]:
-        """Geometry for (condition, seed); unknown values fall back to defaults."""
-        by_seed = None
-        if condition is not None:
-            by_seed = self.per_condition.get(condition)
+        """Geometry for (condition, seed), read from its checkpoint; unknown
+        values fall back to defaults."""
+        by_seed = self.viz_files.get(condition) if condition is not None else None
         if by_seed is None:
-            by_seed = self.per_condition.get(self.default_condition())
+            by_seed = self.viz_files.get(self.default_condition())
         if not by_seed:
             return None
-        if seed is not None and int(seed) in by_seed:
-            return by_seed[int(seed)]
-        return by_seed.get(self.seeds[0]) if self.seeds else None
+        if seed is None or int(seed) not in by_seed:
+            seed = self.seeds[0] if self.seeds else None
+        if seed is None or int(seed) not in by_seed:
+            return None
+        return _load_seed_viz(by_seed[int(seed)], int(seed))
 
     def pois_for(self, seed: Optional[int]) -> List[dict]:
         """The POI catalog for a seed (identical across conditions)."""
@@ -599,10 +708,10 @@ class Job:
     config: Optional["RunConfig"] = None
     created_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
-    # Cancellation: `cancel` is the in-process signal (inline single-seed path);
-    # `mp_cancel` is a multiprocessing Event shared with spawned seed workers,
-    # created per study while the process pool is live. Both are checked between
-    # days by the engine's should_stop, so a stop takes effect within one day.
+    # Cancellation: `cancel` is the in-process signal, checked by the study's own
+    # loop; `mp_cancel` is a manager Event shared with the simulation processes,
+    # created per study while it runs and checked between days by the engine's
+    # should_stop, so a stop takes effect within one simulated day.
     cancel: threading.Event = field(default_factory=threading.Event)
     mp_cancel: Optional[object] = None
     _subs: List["queue.Queue"] = field(default_factory=list)
@@ -710,12 +819,7 @@ def pois_available() -> Dict[str, bool]:
 
 # ── Worker: run ONE simulation (one seed, one condition) ─────────────────────
 #
-# Module-level so it is picklable by ProcessPoolExecutor. Each worker keeps the
-# (POI-augmented) network for a (city, use_real_pois) in a process-global cache
-# and reuses it across every task it handles; the geometry is independent of both
-# seed and condition.
-
-_WORKER_NET_CACHE: Dict[tuple, object] = {}
+# Module-level so it is picklable by ProcessPoolExecutor.
 
 
 def _spec_for(cfg: dict, condition: str) -> Optional[RecommenderSpec]:
@@ -733,15 +837,6 @@ def _spec_for(cfg: dict, condition: str) -> Optional[RecommenderSpec]:
         if raw.get("label") == condition:
             return RecommenderSpec(**raw)
     return None
-
-
-def _worker_network(city: str, use_real_pois: bool):
-    key = (city, bool(use_real_pois))
-    net = _WORKER_NET_CACHE.get(key)
-    if net is None:
-        net = build_network(city)  # metro two-layer or legacy preset
-        _WORKER_NET_CACHE[key] = net
-    return net
 
 
 _NO_POPULATION_WARNED: set = set()
@@ -821,8 +916,77 @@ def _build_sim(cfg: dict, seed: int, condition: str, network, poi_rows,
     )
 
 
-def _run_one(cfg: dict, seed: int, condition: str, cancel_event=None,
-             progress_q=None) -> dict:
+def _agent_segments(sim) -> Dict[int, dict]:
+    """``agent_id -> {income, trust, paradigm, car_access}``. The paradigm only
+    acts on mode choice, so it matters for agents with more than one mode."""
+    segments = sim_metrics.agent_segments(sim)
+    return {a.id: {**segments[a.id], "car_access": a.car_access_type} for a in sim.agents}
+
+
+class SimulationProcessDied(RuntimeError):
+    """A simulation's process ended without reporting back: killed (most likely
+    for memory) or crashed. The task can be retried."""
+
+
+def _run_one(cfg: dict, seed: int, condition: str, cancel_event, progress_q,
+             checkpoint: str) -> dict:
+    """Run one simulation in a child process of its own; return its result
+    without the map data (which the child saves to ``checkpoint``).
+
+    Pool workers are long-lived (Python 3.10's ProcessPoolExecutor cannot retire
+    them), and a Python process keeps most of the heap it has ever used, so a
+    worker that ran the simulation itself would hold its peak for good. A forked
+    child gives every byte back when it exits, whether the run finished, failed
+    or was cancelled. Forking is safe here: a pool worker is a spawned,
+    single-threaded process, and the cancel Event and progress Queue are manager
+    proxies, which reconnect in the child. Results are unchanged: the same code
+    in a fresh process.
+    """
+    ctx = mp.get_context("fork")
+    receive, send = ctx.Pipe(duplex=False)
+    child = ctx.Process(target=_simulate_and_save, name=f"sim-{condition}-{seed}",
+                        args=(send, cfg, seed, condition, cancel_event, progress_q, checkpoint))
+    child.start()
+    send.close()  # the child holds the only writer, so its death ends the pipe
+    try:
+        outcome, payload = receive.recv()
+    except EOFError:
+        child.join()
+        raise SimulationProcessDied(
+            f"{cfg['city']} seed {seed} {condition}: simulation process ended with "
+            f"exit code {child.exitcode} without a result") from None
+    finally:
+        receive.close()
+    child.join()
+    if outcome == "cancelled":
+        raise SimulationCancelled()
+    if outcome == "error":
+        raise RuntimeError(payload)
+    return payload
+
+
+def _simulate_and_save(conn, cfg, seed, condition, cancel_event, progress_q, checkpoint) -> None:
+    """Body of _run_one's child: simulate, save, report one (outcome, payload)."""
+    try:
+        # If memory does run out, the kernel should kill a simulation, which is
+        # retried, rather than the web process, which holds every study.
+        with open("/proc/self/oom_score_adj", "w") as fh:
+            fh.write("800")
+    except OSError:
+        pass
+    try:
+        res = _simulate(cfg, seed, condition, cancel_event, progress_q)
+        conn.send(("ok", _save_task_result(checkpoint, res)))
+    except SimulationCancelled:
+        conn.send(("cancelled", None))
+    except BaseException:  # report any failure as text: not every exception pickles
+        conn.send(("error", traceback.format_exc()))
+    finally:
+        conn.close()
+
+
+def _simulate(cfg: dict, seed: int, condition: str, cancel_event=None,
+              progress_q=None) -> dict:
     """Run ONE simulation: one condition at one seed. The unit of parallelism.
 
     Returns a picklable dict of that run's metrics, its per-agent utilities and
@@ -835,10 +999,10 @@ def _run_one(cfg: dict, seed: int, condition: str, cancel_event=None,
     """
     poi_rows = get_datasource().poi_rows(cfg["city"]) if bool(cfg["use_real_pois"]) else None
     use_real_pois = bool(poi_rows)
-    network = _worker_network(cfg["city"], use_real_pois)
+    network = build_network(cfg["city"])  # metro two-layer or legacy preset
 
     # Cooperative cancellation: checked between days by the engine. `cancel_event`
-    # is the Job's threading.Event (inline) or a shared mp Event (pool workers).
+    # is the study's manager Event, set when the study is cancelled or fails.
     should_stop = (lambda: cancel_event.is_set()) if cancel_event is not None else None
 
     per_day: List[Dict[int, dict]] = []
@@ -874,6 +1038,12 @@ def _run_one(cfg: dict, seed: int, condition: str, cancel_event=None,
             "recommendation_acceptance_rate": summ.get("recommendation_acceptance_rate", 0.0),
             "avg_travel_time_min": summ.get("avg_travel_time_min", 0.0),
         },
+        # For the saved study record only: every eval-day leisure trip's net
+        # utility, and each agent's segments, so Table 1 can be broken down by
+        # decision paradigm (or income, trust, car access) after the fact.
+        "eval_trips": [[a.id, leisure_net_utility(t)]
+                       for a in sim.agents for t in a.trips if t.purpose == "leisure"],
+        "agent_segments": _agent_segments(sim),
         "viz": {
             "merged": merged,
             "trip_index": viz.build_trip_index(merged),
@@ -905,6 +1075,57 @@ def _run_one(cfg: dict, seed: int, condition: str, cancel_event=None,
             "poi_source": "real dataset" if use_real_pois else "synthetic",
         }
     return out
+
+
+# ── Study record (saved to disk) ─────────────────────────────────────────────
+
+def _save_study_record(run_id: str, cfg: RunConfig, seeds: List[int],
+                       results: Dict[Tuple[int, str], dict],
+                       table1: List[dict], table2: List[dict]) -> str:
+    """Write the study's per-run details to ``STUDY_RECORD_DIR`` and return the path.
+
+    The website shows Table 1 and Table 2; this keeps what they were computed
+    from, run by run, so the study can be re-analysed later without re-running
+    it: each (seed, condition) run's Table-1 row, its Table-2 row against the
+    same seed's No-RS run, every eval-day leisure trip utility, each agent's
+    eval-day and whole-run mean utility, and each agent's segments (decision
+    paradigm, income band, trust group, car access). Agent ids are JSON keys,
+    so they come back as strings.
+    """
+    runs = []
+    for seed in seeds:
+        control_utils = results[(seed, CONTROL)]["utils"]
+        for condition in cfg.all_conditions():
+            res = results[(seed, condition)]
+            runs.append({
+                "seed": seed,
+                "condition": condition,
+                "table1": res["t1"],
+                "table2": (None if condition == CONTROL
+                           else table2_from_utilities(res["utils"], control_utils)),
+                "summary": res["summary"],
+                "eval_trips": res["eval_trips"],
+                "eval_utility": res["utils"],
+                "run_utility": res["metrics"]["run_utility"],
+                "agent_segments": res["agent_segments"],
+            })
+    record = {
+        "run_id": run_id,
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "config": asdict(cfg),
+        "conditions": cfg.all_conditions(),
+        "seeds": seeds,
+        "table1": table1,
+        "table2": table2,
+        "runs": runs,
+    }
+    os.makedirs(STUDY_RECORD_DIR, exist_ok=True)
+    path = os.path.join(STUDY_RECORD_DIR, f"{cfg.city}_{run_id}.json.gz")
+    tmp = path + ".tmp"
+    with gzip.open(tmp, "wt", encoding="utf-8") as fh:
+        json.dump(record, fh)
+    os.replace(tmp, path)  # never leave a half-written record under the final name
+    return path
 
 
 # ── Aggregation across seeds ─────────────────────────────────────────────────
@@ -1057,17 +1278,6 @@ def _agg_metrics(per_seed: List[dict]) -> Dict[str, object]:
 
 # ── Run manager ──────────────────────────────────────────────────────────────
 
-class _InlineProgress:
-    """A ``.put()``-compatible progress sink for the single-task inline path,
-    where there is no process boundary and no Manager queue to route through."""
-
-    def __init__(self, tick):
-        self._tick = tick
-
-    def put(self, event) -> None:
-        self._tick(event)
-
-
 class RunManager:
     """Builds and caches studies, running up to MAX_STUDIES of them at once and
     parallelising each (seed x condition) grid across a shared process pool."""
@@ -1200,7 +1410,9 @@ class RunManager:
         seeds = cfg.seeds()
         conditions = cfg.all_conditions()
         # One task = one simulation = one (seed, condition) pair, No RS included.
+        # Oracle tasks first: they are the slowest, so they set the study's length.
         tasks = [(s, c) for s in seeds for c in conditions]
+        tasks.sort(key=lambda task: task[1] != ORACLE)
         num_days = max(1, int(cfg.num_days))
         job.total = len(tasks) * num_days   # progress counted in simulated days
         # Each condition runs once per seed, so every arm has the same
@@ -1210,12 +1422,22 @@ class RunManager:
         job.cond_total = cond_total
         job.per_condition = {c: 0 for c in conditions}
 
-        # Pre-build the network once so worker processes only ever *load* the
-        # disk caches (no concurrent Overpass download / warm-pickle race).
-        build_network(cfg.city)
-
+        # Simulations a previous attempt at this same study already finished.
         cfg_dict = asdict(cfg)
+        checkpoint = {t: _task_checkpoint(run_id, *t) for t in tasks}
         results: Dict[Tuple[int, str], dict] = {}
+        for t in tasks:
+            res = _load_task_result(checkpoint[t], *t)
+            if res is not None:
+                results[t] = res
+                job.current += num_days
+                job.per_condition[t[1]] += num_days
+        tasks = [t for t in tasks if t not in results]
+
+        # Workers only load a warmed network from disk. An unwarmed one is built
+        # here once, so they never download it concurrently.
+        if tasks and not warmed_cities().get(cfg.city):
+            build_network(cfg.city)
 
         # Ticks arrive from every worker at once, so the counter needs a lock.
         # Publishing happens outside it to keep the SSE fan-out off the critical
@@ -1237,125 +1459,117 @@ class RunManager:
                          "cond_total": cond_total, "per_condition": by_cond,
                          "elapsed_sec": time.time() - job.created_at})
 
-        if len(tasks) == 1:
-            # Inline: the Job's threading.Event is visible to should_stop directly.
-            s, c = tasks[0]
-            res = _run_one(cfg_dict, s, c, cancel_event=job.cancel,
-                           progress_q=_InlineProgress(_tick))
-            results[(res["seed"], res["condition"])] = res
-        else:
-            # 'spawn': fork-after-threads under uvicorn is unsafe.
-            ctx = mp.get_context("spawn")
-            # Manager-backed Event and Queue are shareable with spawned workers.
-            # Setting the Event makes each worker's should_stop fire at its next
-            # day boundary; the Queue carries day-level progress back.
-            manager_proc = ctx.Manager()
-            job.mp_cancel = manager_proc.Event()
-            progress_q = manager_proc.Queue()
-            if job.cancel.is_set():  # cancel arrived during setup
-                job.mp_cancel.set()
+        if tasks:
+            self._run_tasks(run_id, cfg_dict, tasks, checkpoint, results, job, _tick)
+        return self._assemble(run_id, cfg, seeds, results)
 
-            stop_drain = threading.Event()
+    @staticmethod
+    def _run_tasks(run_id: str, cfg_dict: dict, tasks: List[Tuple[int, str]],
+                   checkpoint: Dict[Tuple[int, str], str],
+                   results: Dict[Tuple[int, str], dict], job: Job, tick) -> None:
+        """Run ``tasks`` on the shared pool as the governor allows, adding each
+        finished simulation to ``results``.
 
-            def _drain() -> None:
-                while not stop_drain.is_set():
-                    try:
-                        _tick(progress_q.get(timeout=0.2))
-                    except queue.Empty:
-                        continue
-                    except Exception:
-                        break  # manager torn down — expected at end of study
+        Tasks start in order (Oracle first) whenever the governor admits them,
+        re-checked on every pass. So a study that starts alone spreads across the
+        box, gives slots back when another study starts, and takes them again
+        when that one ends. A task whose process dies is retried, up to
+        MAX_TASK_ATTEMPTS in all. If the study is cancelled or fails, its running
+        simulations are told to stop and are waited for, so that their memory
+        is reserved until it is actually free.
+        """
+        # 'spawn': fork-after-threads under uvicorn is unsafe. Manager-backed
+        # Event and Queue are shareable with the workers: setting the Event
+        # stops each simulation at its next day boundary; the Queue carries
+        # day-level progress back.
+        ctx = mp.get_context("spawn")
+        manager_proc = ctx.Manager()
+        job.mp_cancel = manager_proc.Event()
+        progress_q = manager_proc.Queue()
+        if job.cancel.is_set():  # cancel arrived during setup
+            job.mp_cancel.set()
 
-            drain = threading.Thread(target=_drain, name="progress", daemon=True)
-            drain.start()
-            # Tasks are started against the governor's CURRENT quota rather
-            # than submitted all at once, and the quota is re-read on every
-            # top-up. So a study that starts alone spreads across the box, gives
-            # slots back the moment another study starts, and takes them again
-            # when that one ends — without the grid being re-planned.
-            pool = shared_pool()
-            pending = list(tasks)
-            in_flight: Dict[object, Tuple[int, str]] = {}
-            GOVERNOR.register(run_id)
-            def _submit_next() -> None:
-                """Start one queued task. A slot is already held for it."""
-                s_, c_ = pending.pop(0)
+        stop_drain = threading.Event()
+
+        def _drain() -> None:
+            while not stop_drain.is_set():
                 try:
-                    fut = pool.submit(_run_one, cfg_dict, s_, c_,
-                                      job.mp_cancel, progress_q)
+                    tick(progress_q.get(timeout=0.2))
+                except queue.Empty:
+                    continue
+                except Exception:
+                    break  # manager torn down — expected at end of study
+
+        drain = threading.Thread(target=_drain, name="progress", daemon=True)
+        drain.start()
+
+        pool = shared_pool()
+        cost = {t: TaskCost(_task_memory_gb(cfg_dict, t[1]), t[1] == ORACLE) for t in tasks}
+        pending = list(tasks)
+        attempts = {t: 0 for t in tasks}
+        in_flight: Dict[object, Tuple[int, str]] = {}
+        GOVERNOR.register(run_id)
+
+        def _start_what_fits() -> None:
+            for task in list(pending):
+                if not GOVERNOR.try_acquire(run_id, cost[task]):
+                    continue
+                pending.remove(task)
+                attempts[task] += 1
+                try:
+                    fut = pool.submit(_run_one, cfg_dict, task[0], task[1], job.mp_cancel,
+                                      progress_q, checkpoint[task])
                 except (BrokenProcessPool, RuntimeError):
-                    GOVERNOR.release(run_id)
+                    GOVERNOR.release(run_id, cost[task])
                     reset_shared_pool()
                     raise
-                in_flight[fut] = (s_, c_)
+                in_flight[fut] = task
 
-            try:
-                while pending or in_flight:
-                    # Top up without blocking: this thread reaps its own tasks
-                    # below, so blocking here would wait on a slot only this
-                    # loop can free.
-                    while pending and GOVERNOR.try_acquire(run_id):
-                        _submit_next()
+        def _finish(fut) -> Tuple[int, str]:
+            task = in_flight.pop(fut)
+            GOVERNOR.release(run_id, cost[task])
+            return task
 
-                    if not in_flight:
-                        if not pending:
-                            break
-                        # Nothing running and no free slot — the box is busy.
-                        # Now blocking is safe and right: there is nothing of
-                        # ours to reap, and the wait ends when any study frees
-                        # a slot or the study is cancelled.
-                        #
-                        # acquire() returns False ONLY on cancellation, and that
-                        # has to be raised, not broken out of: falling through
-                        # would leave the loop and assemble a study from
-                        # whatever partial results exist, storing a cancelled
-                        # study as a finished one. Everywhere else cancellation
-                        # arrives as this exception from fut.result(); a study
-                        # cancelled while queueing has no future to raise it.
-                        if not GOVERNOR.acquire(run_id, should_stop=job.cancel.is_set):
-                            raise SimulationCancelled()
-                        _submit_next()
-                        continue
-
-                    done, _ = wait(list(in_flight), return_when=FIRST_COMPLETED,
-                                   timeout=2.0)
-                    for fut in done:
-                        in_flight.pop(fut, None)
-                        GOVERNOR.release(run_id)
-                    for fut in done:
-                        try:
-                            res = fut.result()
-                        except SimulationCancelled:
-                            # cancel() only drops tasks that have not started;
-                            # already-running ones keep going until their next
-                            # day boundary sees mp_cancel. Their slots are
-                            # released now anyway, so other studies can move
-                            # immediately — a few slots are briefly
-                            # oversubscribed while the cancelled tasks wind
-                            # down, which is the right trade against making
-                            # every other study wait for a study that is over.
-                            for f in in_flight:
-                                f.cancel()
-                            for _ in range(len(in_flight)):
-                                GOVERNOR.release(run_id)
-                            in_flight.clear()
+        try:
+            while pending or in_flight:
+                if job.cancel.is_set():
+                    raise SimulationCancelled()
+                _start_what_fits()
+                if not in_flight:
+                    GOVERNOR.wait(timeout=2.0)  # nothing of ours running: wait for room
+                    continue
+                done, _ = wait(list(in_flight), return_when=FIRST_COMPLETED, timeout=2.0)
+                for fut in done:
+                    task = _finish(fut)
+                    try:
+                        results[task] = fut.result()
+                    except SimulationProcessDied as exc:
+                        if attempts[task] >= MAX_TASK_ATTEMPTS:
                             raise
-                        except BrokenProcessPool:
-                            reset_shared_pool()
-                            raise
-                        results[(res["seed"], res["condition"])] = res
-            finally:
-                for f in in_flight:
-                    f.cancel()
-                for _ in range(len(in_flight)):
-                    GOVERNOR.release(run_id)
-                GOVERNOR.unregister(run_id)
-                stop_drain.set()
-                drain.join(timeout=1.0)
-                job.mp_cancel = None
-                manager_proc.shutdown()
+                        print(f"study {run_id}: {exc}; retrying "
+                              f"(attempt {attempts[task] + 1} of {MAX_TASK_ATTEMPTS})", flush=True)
+                        pending.insert(0, task)
+                    except BrokenProcessPool:
+                        reset_shared_pool()
+                        raise
+        except BaseException:
+            # Stop this study's simulations and wait for them to wind down
+            # (within one simulated day), keeping their memory reserved until then.
+            job.mp_cancel.set()
+            for fut in list(in_flight):
+                if fut.cancel():  # never started
+                    _finish(fut)
+            wait(list(in_flight))
+            raise
+        finally:
+            for fut in list(in_flight):
+                _finish(fut)
+            GOVERNOR.unregister(run_id)
+            stop_drain.set()
+            drain.join(timeout=1.0)
+            job.mp_cancel = None
+            manager_proc.shutdown()
 
-        return self._assemble(run_id, cfg, seeds, results)
 
     @staticmethod
     def _welfare_map(conditions: List[str], ok_seeds: List[int],
@@ -1445,6 +1659,12 @@ class RunManager:
             for c in conditions if c != CONTROL
         ]
 
+        try:
+            path = _save_study_record(run_id, cfg, ok_seeds, results, table1, table2)
+            print(f"study {run_id}: record saved to {path}", flush=True)
+        except Exception as exc:  # the study itself is still good; say so loudly
+            print(f"study {run_id}: FAILED to save study record: {exc!r}", flush=True)
+
         t1_by_cond = {r["condition"]: r for r in table1}
         t2_by_cond = {r["condition"]: r for r in table2}
         # One headline per condition; the frontend shows whichever the map is on.
@@ -1480,18 +1700,8 @@ class RunManager:
         }
         welfare_map = self._welfare_map(conditions, ok_seeds, results)
 
-        per_condition = {
-            c: {
-                s: SeedViz(
-                    seed=s,
-                    merged={int(k): v for k, v in results[(s, c)]["viz"]["merged"].items()},
-                    trip_index=results[(s, c)]["viz"]["trip_index"],
-                    time_span=results[(s, c)]["viz"]["time_span"],
-                )
-                for s in ok_seeds
-            }
-            for c in conditions
-        }
+        viz_files = {c: {s: results[(s, c)]["viz_file"] for s in ok_seeds} for c in conditions}
+        time_spans = {c: {s: results[(s, c)]["time_span"] for s in ok_seeds} for c in conditions}
         # POIs and the network extent came back on the No-RS task only.
         pois_by_seed = {s: results[(s, CONTROL)].get("pois", []) for s in ok_seeds}
         net0 = results[(ok_seeds[0], CONTROL)]["net"]
@@ -1501,7 +1711,8 @@ class RunManager:
             config=cfg,
             seeds=ok_seeds,
             conditions=conditions,
-            per_condition=per_condition,
+            viz_files=viz_files,
+            time_spans=time_spans,
             pois_by_seed=pois_by_seed,
             table1=table1,
             table2=table2,

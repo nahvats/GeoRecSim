@@ -267,9 +267,9 @@ def main():
     # Both sides of the difference must come from one pricing method, or the
     # comparison stops being like-for-like.
     src = (REPO_ROOT / "welfare_rs" / "agent.py").read_text()
-    check("both cost sides priced by _price_round_trip",
-          src.count("_price_round_trip(") == 3,  # 1 def + 2 call sites
-          f"{src.count('_price_round_trip(')} occurrences (expect 3)")
+    check("both cost sides priced by _price_trip",
+          src.count("_price_trip(") == 3,  # 1 def + 2 call sites
+          f"{src.count('_price_trip(')} occurrences (expect 3)")
     check("agent's own pick is priced once and reused",
           '"trip_disutility": expected_trip_disutility' in src)
 

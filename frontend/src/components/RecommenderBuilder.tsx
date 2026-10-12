@@ -59,8 +59,9 @@ export const BLANK_SPEC: RecommenderSpec = {
   popularity_gamma: 1,
   learning_rate: 0.12,
   welfare_gate: "",
-  pup_alpha: 0.6,
-  rm_epsilon: 0.3,
+  // Defaults match welfare_rs.params.WELFARE_GATE_DEFAULTS (gating threshold study optima).
+  pup_alpha: 0.3,
+  rm_epsilon: 0.255,
   random_ranking: false,
 };
 

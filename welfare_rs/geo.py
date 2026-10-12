@@ -44,6 +44,26 @@ from .utils import haversine_km  # re-exported: geo is the historic import site
 LatLon = Tuple[float, float]
 BBox = Tuple[float, float, float, float]  # (west, south, east, north)
 
+# Size limits of the per-pair memo caches, in entries. Unbounded, they grew a
+# long run by gigabytes: the Oracle prices every venue of a subtype on every
+# query, and every day adds thousands of new routes to draw. A pair entry is
+# ~200 bytes; a route shape is ~2 KB.
+_PAIR_CACHE_CAP = 1_000_000
+_GEOM_CACHE_CAP = 100_000
+
+
+def _remember(cache: dict, key, value, cap: int) -> None:
+    """Store ``value`` in a memo cache, clearing the cache first if it is full.
+
+    Cleared wholesale rather than evicted one at a time, like the routing-matrix
+    row cache: a run's working set moves together, and this keeps the hot path
+    free of bookkeeping. The caches are pure memos, so this changes speed only,
+    never a result.
+    """
+    if len(cache) >= cap:
+        cache.clear()
+    cache[key] = value
+
 DEFAULT_CACHE_DIR = os.environ.get(
     "WELFARE_RS_CACHE",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache"),
@@ -188,7 +208,7 @@ class RoadNetwork:
         # (km measured along the *fastest* path), and a per-pair front cache.
         self._ss_time_cache: Dict[int, Tuple[int, Dict[int, Tuple[float, float]]]] = {}
         self._car_cache: Dict[Tuple[int, int], Tuple[float, float]] = {}
-        self._geom_cache: Dict[Tuple[int, int], List[LatLon]] = {}
+        self._geom_cache: Dict[Tuple[int, int], np.ndarray] = {}
         self._route_targets: set = set()
         self._targets_version = 0
 
@@ -457,7 +477,7 @@ class RoadNetwork:
             dist = haversine_km(self.node_latlon(orig), self.node_latlon(dest))
         else:
             dist = meters / 1000.0
-        self._dist_cache[key] = dist
+        _remember(self._dist_cache, key, dist, _PAIR_CACHE_CAP)
         return dist
 
     def route_length_km_latlon(self, a: LatLon, b: LatLon) -> float:
@@ -487,7 +507,7 @@ class RoadNetwork:
                 self._targets_version += 1
             meters = self._single_source(orig).get(dest)
         km = None if (meters is None or not np.isfinite(meters)) else meters / 1000.0
-        self._reach_cache[key] = km
+        _remember(self._reach_cache, key, km, _PAIR_CACHE_CAP)
         return km
 
     def snap_gap_km(self, lat: float, lon: float) -> float:
@@ -737,7 +757,7 @@ class RoadNetwork:
                 if cached is None:  # unreachable
                     km = haversine_km(self.node_latlon(orig), self.node_latlon(dest))
                     cached = (None, km)
-            self._car_cache[key] = cached
+            _remember(self._car_cache, key, cached, _PAIR_CACHE_CAP)
         if cached[0] is None:
             return None
         return cached
@@ -813,8 +833,13 @@ class RoadNetwork:
                 coords.reverse()
         return coords
 
-    def route_geometry_latlon(self, a: LatLon, b: LatLon) -> List[LatLon]:
-        """Return the route polyline as ``[(lat, lon), ...]`` for visualization."""
+    def route_geometry_latlon(self, a: LatLon, b: LatLon) -> Sequence[LatLon]:
+        """Return the route polyline as ``(lat, lon)`` rows, for visualization.
+
+        Cached per node pair as a float64 ``(N, 2)`` array: the same values as a
+        list of tuples at ~1/7 of the memory, which matters because a long run
+        routes thousands of new pairs a day.
+        """
         orig = self.nearest_node(*a)
         dest = self.nearest_node(*b)
         if orig == dest:
@@ -837,8 +862,8 @@ class RoadNetwork:
                 for latlon in seg:
                     if not pts or pts[-1] != latlon:
                         pts.append(latlon)
-        pts = pts or [self.node_latlon(orig), self.node_latlon(dest)]
-        self._geom_cache[(orig, dest)] = pts
+        pts = np.asarray(pts or [self.node_latlon(orig), self.node_latlon(dest)], dtype=np.float64)
+        _remember(self._geom_cache, (orig, dest), pts, _GEOM_CACHE_CAP)
         return pts
 
     # ── POI insertion (mid-block nodes) ──────────────────────────────────────

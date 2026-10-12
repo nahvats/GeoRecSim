@@ -253,7 +253,7 @@ def _require_seed_viz(run_id: str, condition: Optional[str], seed: Optional[int]
 
 
 def _resolved_condition(run, condition: Optional[str]) -> str:
-    return condition if condition in run.per_condition else run.default_condition()
+    return condition if run.has_condition(condition) else run.default_condition()
 
 
 @app.get("/api/runs/{run_id}/timeline")
