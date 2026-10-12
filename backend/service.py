@@ -5,18 +5,19 @@ No-RS control is always one of them — it is the baseline every Table-2 row is
 paired against, and its movement is worth watching on the map in its own right.
 
 The unit of parallelism is one simulation: every ``(seed, condition)`` pair is a
-separate task on a ``ProcessPoolExecutor``. A 3-seed study over 4 recommenders is
-15 simulations running at once, not 3 sequential pairs. Why processes, and what
+separate process. A 3-seed study over 4 recommenders is 15 simulations running
+at once, not 3 sequential pairs. Why processes, and what
 they do and don't share:
 
 * Threads wouldn't help — the agent loop is pure-Python (GIL-bound). Separate
   processes each get their own module globals, so there is no cross-task
   contention.
-* Each simulation runs in a child process of its own, forked from a pool
-  worker, and loads its own copy of the metro network (0.8-3.2 GB resident).
-  The child exits when the simulation ends, so every byte goes back to the OS,
-  and it saves its own result to disk (see ``_run_one`` and the checkpoint
-  section). The web process keeps no map data in memory.
+* Each metro with a study running has one host process, which loads the metro
+  network once (0.8-3.2 GB) and forks a child per simulation; the children
+  share the network instead of each loading a copy (see ``SimulationHost``).
+  A child exits when its simulation ends, so every byte goes back to the OS,
+  and it saves its own result to disk (see the checkpoint section). The web
+  process keeps no map data in memory.
 * The routing matrices (welfare_rs.routing_matrix, 3-35 GB per metro) ARE shared:
   they are opened ``mmap_mode="r"``, so every simulation reads one page-cache copy.
 * Memory, not cores, is what limits how many simulations run at once: each
@@ -35,7 +36,10 @@ from __future__ import annotations
 
 import functools
 import gzip
+import ctypes
+import gc
 import hashlib
+import itertools
 import json
 import math
 import pickle
@@ -50,12 +54,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import multiprocessing as mp
 import queue
+import signal
 import threading
 import time
 import traceback
-from concurrent.futures import (FIRST_COMPLETED, ProcessPoolExecutor,
-                                ThreadPoolExecutor, wait)
-from concurrent.futures.process import BrokenProcessPool
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from multiprocessing import connection as mp_connection
 from dataclasses import asdict, dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -152,10 +156,8 @@ def precomputed_cities() -> dict:
 
 MAX_SEEDS = 12
 
-# Ceiling on simulations running at once. Each is a process holding its own copy
-# of the metro graph (a few hundred MB resident); the multi-GB routing matrices
-# are memmapped read-only, so those cost one shared page-cache copy no matter how
-# many workers there are. Defaults to every core — set WELFARE_RS_MAX_WORKERS to
+# Ceiling on simulations running at once, one per core by default. Memory
+# usually binds first (see ResourceGovernor). Set WELFARE_RS_MAX_WORKERS to
 # leave the box headroom for other work.
 MAX_WORKERS = int(os.environ.get("WELFARE_RS_MAX_WORKERS", "0") or 0) or (os.cpu_count() or 1)
 
@@ -193,26 +195,37 @@ MAX_ORACLE_TASKS = int(os.environ.get("WELFARE_RS_MAX_ORACLE_TASKS", "0") or 0) 
 MAX_TASK_ATTEMPTS = 3
 
 
-# Peak memory of one simulation: the metro network, plus a cost per agent once
-# the run is set up, plus growth per agent-day (map data and the capped route
-# memos). Measured 2026-10-12 with 2,500 agents over 15 days (anonymous memory
-# of the simulation process); metros not measured take the largest values.
-# Oracle and the other arms grow alike now that the route memos are capped.
-_NETWORK_GB = {"la": 3.0, "nyc": 0.8, "houston": 3.2, "chicago": 2.9}
-_PER_1000_AGENTS_GB = {"la": 0.8, "nyc": 0.5, "houston": 0.6, "chicago": 0.9}
-_GROWTH_GB_PER_1000_AGENT_DAYS = {"oracle": 0.04, "other": 0.04}
-_MEMORY_MARGIN = 1.25        # headroom on every estimate
+# Memory estimates, in GB. A metro's host holds its network once (_NETWORK_GB);
+# each simulation, forked from the host, holds its agents and what it builds up
+# over the run, plus the part of the shared network it ends up copying (Python
+# writes to an object's memory just by referencing it). Measured 2026-10-12 on
+# simulations forked from a host, 2,500 agents, Personalized and Oracle over
+# 3-8 days: per-1,000-agent memory on day 1 and growth per day, taking the
+# larger of the two arms. Growth is projected linearly, which overstates it (the
+# copying of the shared network tails off); where a 15-day probe without
+# sharing gave a lower 60-day peak, growth is capped to match it.
+_NETWORK_GB = {"la": 3.0, "nyc": 0.8, "houston": 3.2, "chicago": 2.9,
+               "sf_bay": 1.0, "dc": 0.9, "seattle": 1.2, "miami": 0.6}
+_SIM_BASE_GB = {"la": 1.27, "nyc": 0.48, "houston": 1.12, "chicago": 1.19,
+                "sf_bay": 0.74, "dc": 0.50, "seattle": 0.79, "miami": 0.42}
+_SIM_GROWTH_GB_PER_1000_AGENT_DAYS = {"la": 0.012, "nyc": 0.025, "houston": 0.046, "chicago": 0.028,
+                                      "sf_bay": 0.021, "dc": 0.043, "seattle": 0.037, "miami": 0.025}
+_MEMORY_MARGIN = 1.15                   # headroom on every estimate
+
+
+def _host_memory_gb(city: str) -> float:
+    """Memory a metro's host holds: its network, with margin."""
+    return _MEMORY_MARGIN * (_NETWORK_GB.get(city, max(_NETWORK_GB.values())) + 0.2)
 
 
 def _task_memory_gb(cfg: dict, condition: str) -> float:
-    """Expected peak memory of one simulation of this study, in GB, with margin."""
+    """Expected peak memory of one simulation of this study, in GB, with margin
+    (its host's network not included)."""
     city = cfg["city"]
     agents_k = int(cfg["num_agents"]) / 1000.0
-    growth = _GROWTH_GB_PER_1000_AGENT_DAYS["oracle" if condition == ORACLE else "other"]
-    network = _NETWORK_GB.get(city, max(_NETWORK_GB.values()))
-    per_agent = _PER_1000_AGENTS_GB.get(city, max(_PER_1000_AGENTS_GB.values()))
-    peak = network + agents_k * (per_agent + growth * int(cfg["num_days"]))
-    return _MEMORY_MARGIN * peak
+    base = _SIM_BASE_GB.get(city, max(_SIM_BASE_GB.values()))
+    growth = _SIM_GROWTH_GB_PER_1000_AGENT_DAYS.get(city, max(_SIM_GROWTH_GB_PER_1000_AGENT_DAYS.values()))
+    return _MEMORY_MARGIN * (0.5 + agents_k * (base + growth * int(cfg["num_days"])))
 
 
 def _cgroup_headroom() -> Optional[int]:
@@ -264,20 +277,27 @@ class TaskCost:
 class ResourceGovernor:
     """Decides which simulation may START, across every running study.
 
-    One shared process pool serves every study. A simulation starts only if all
-    of these hold, and keeps its share until it ends:
+    A simulation starts only if all of these hold, and keeps its share until it
+    ends:
 
-    * CPU: each running study gets ``MAX_WORKERS // n_studies`` slots (at least
-      one), recomputed on every start and finish, so a study widens as others
-      finish and narrows as they start, and no study is starved.
+    * CPU: each registered study gets ``MAX_WORKERS // n_studies`` slots (at
+      least one), recomputed on every start and finish, so a study widens as
+      others finish and narrows as they start.
     * Memory: the simulation reserves its expected PEAK memory
-      (``_task_memory_gb``), and all reservations must fit in
-      ``MEMORY_BUDGET_GB``. Reserving the peak is the point. A simulation starts
-      at ~0.1 GB and reaches several GB minutes later, so a check of free memory
-      at start let 56 of them start together and then outgrow the box together
-      (the service was killed for memory on 2026-10-11).
+      (``_task_memory_gb``) and all reservations, plus those of the metro hosts'
+      networks, must fit in ``MEMORY_BUDGET_GB``. Reserving the peak is the
+      point: a simulation starts small and reaches several GB minutes later, so
+      a check of free memory at start let 56 start together and then outgrow
+      the box together (the service was killed for memory on 2026-10-11).
+    * Fairness: each registered study may reserve at most an equal share of the
+      memory left after the hosts, so every study runs at once instead of the
+      first one to register taking it all. A study with nothing running may
+      always start one simulation that fits, so a small share never stalls it.
     * Oracle: at most ``MAX_ORACLE_TASKS`` Oracle simulations at once.
     * The box must still have ``MIN_FREE_RAM_GB`` available.
+
+    Studies register when they are submitted, not when they start running, so
+    a batch submitted together shares from the first simulation on.
     """
 
     def __init__(self, total_slots: int, memory_budget_gb: float, max_oracle: int,
@@ -286,8 +306,9 @@ class ResourceGovernor:
         self._memory_budget = memory_budget_gb
         self._max_oracle = max(1, max_oracle)
         self._min_free_ram = max(0, min_free_ram_bytes)
-        self._held: Dict[str, int] = {}
-        self._reserved_gb = 0.0
+        self._held: Dict[str, int] = {}          # run id -> simulations running
+        self._study_gb: Dict[str, float] = {}    # run id -> memory reserved
+        self._host_gb: Dict[str, float] = {}     # metro -> its host's network
         self._oracles = 0
         self._cond = threading.Condition()
         self._ram_waits = 0
@@ -295,15 +316,29 @@ class ResourceGovernor:
     def register(self, run_id: str) -> None:
         with self._cond:
             self._held.setdefault(run_id, 0)
-            self._cond.notify_all()      # everyone's quota just shrank
+            self._study_gb.setdefault(run_id, 0.0)
+            self._cond.notify_all()      # everyone's share just shrank
 
     def unregister(self, run_id: str) -> None:
         with self._cond:
             self._held.pop(run_id, None)
-            self._cond.notify_all()      # everyone's quota just grew
+            self._study_gb.pop(run_id, None)
+            self._cond.notify_all()      # everyone's share just grew
+
+    def reserve_host(self, city: str, memory_gb: float) -> None:
+        with self._cond:
+            self._host_gb[city] = memory_gb
+
+    def release_host(self, city: str) -> None:
+        with self._cond:
+            self._host_gb.pop(city, None)
+            self._cond.notify_all()
 
     def _quota_locked(self) -> int:
         return max(1, self._total // max(1, len(self._held)))
+
+    def _reserved_locked(self) -> float:
+        return sum(self._study_gb.values()) + sum(self._host_gb.values())
 
     def _ram_ok(self) -> bool:
         if not self._min_free_ram:
@@ -317,7 +352,10 @@ class ResourceGovernor:
             held = self._held.get(run_id, 0)
             if held >= self._quota_locked() or sum(self._held.values()) >= self._total:
                 return False
-            if self._reserved_gb + cost.memory_gb > self._memory_budget:
+            if self._reserved_locked() + cost.memory_gb > self._memory_budget:
+                return False
+            share = (self._memory_budget - sum(self._host_gb.values())) / max(1, len(self._held))
+            if held and self._study_gb.get(run_id, 0.0) + cost.memory_gb > share:
                 return False
             if cost.oracle and self._oracles >= self._max_oracle:
                 return False
@@ -325,7 +363,7 @@ class ResourceGovernor:
                 self._ram_waits += 1
                 return False
             self._held[run_id] = held + 1
-            self._reserved_gb += cost.memory_gb
+            self._study_gb[run_id] = self._study_gb.get(run_id, 0.0) + cost.memory_gb
             self._oracles += cost.oracle
             return True
 
@@ -333,7 +371,8 @@ class ResourceGovernor:
         with self._cond:
             if self._held.get(run_id):
                 self._held[run_id] -= 1
-            self._reserved_gb = max(0.0, self._reserved_gb - cost.memory_gb)
+            if run_id in self._study_gb:
+                self._study_gb[run_id] = max(0.0, self._study_gb[run_id] - cost.memory_gb)
             self._oracles = max(0, self._oracles - cost.oracle)
             self._cond.notify_all()
 
@@ -352,7 +391,9 @@ class ResourceGovernor:
                 "slots_in_use": sum(self._held.values()),
                 "per_study": dict(self._held),
                 "memory_budget_gb": self._memory_budget,
-                "memory_reserved_gb": round(self._reserved_gb, 1),
+                "memory_reserved_gb": round(self._reserved_locked(), 1),
+                "memory_per_study_gb": {k: round(v, 1) for k, v in self._study_gb.items()},
+                "memory_hosts_gb": {k: round(v, 1) for k, v in self._host_gb.items()},
                 "oracle_tasks": self._oracles,
                 "ram_free_gb": round(free / 1e9, 1) if free is not None else None,
                 "ram_floor_gb": round(self._min_free_ram / 1e9, 1),
@@ -422,34 +463,180 @@ def _load_seed_viz(path: str, seed: int) -> "SeedViz":
                    trip_index=data["trip_index"], time_span=data["time_span"])
 
 
-# ONE pool for the whole box, not one per study, so the process count stays at
-# MAX_WORKERS however many studies run; the governor decides which study may
-# use it. Its workers only wait: each simulation runs in a child process of its
-# own (see _run_one).
-_POOL_LOCK = threading.Lock()
-_POOL = None
+# ── Simulation hosts ─────────────────────────────────────────────────────────
+#
+# One host process per metro with a study running. It loads the metro network
+# once and starts each simulation as a forked child, which shares the network's
+# memory instead of loading its own copy (0.8-3.2 GB). A child exits when its
+# simulation ends, so every byte it used goes back to the OS. The host is
+# spawned (fork-after-threads under uvicorn is unsafe) and single-threaded, so
+# forking from it is safe; it is shut down when no study needs its metro.
 
 
-def shared_pool():
-    global _POOL
-    with _POOL_LOCK:
-        if _POOL is None:
-            _POOL = ProcessPoolExecutor(max_workers=MAX_WORKERS,
-                                        mp_context=mp.get_context("spawn"))
-        return _POOL
+class SimulationProcessDied(RuntimeError):
+    """A simulation's process, or its host, ended without reporting back:
+    killed (most likely for memory) or crashed. The task can be retried."""
 
 
-def reset_shared_pool() -> None:
-    """Drop the pool after a worker dies, so the next study builds a fresh one.
+_HOST_PID = None  # set in a host process; inherited by the simulations it forks
 
-    A BrokenProcessPool is terminal for the executor, and a shared executor
-    means it would be terminal for every study that came after it.
+
+def _host_main(conn, city: str) -> None:
+    """Body of a SimulationHost process: serve simulation requests for ``city``.
+
+    A request is ``(task_id, args)`` for _simulate_and_save; each finished child
+    is answered with ``(task_id, (outcome, payload))``. ``None``, or the web
+    process going away, ends the host.
     """
-    global _POOL
-    with _POOL_LOCK:
-        old, _POOL = _POOL, None
-    if old is not None:
-        old.shutdown(wait=False, cancel_futures=True)
+    global _HOST_PID
+    _HOST_PID = os.getpid()
+    network = build_network(city)
+    gc.collect()
+    gc.freeze()  # keep the collector off the network's objects, or every child would copy them
+    fork = mp.get_context("fork")
+    running: Dict[object, Tuple[int, object]] = {}  # child's pipe -> (task id, child)
+    try:
+        while True:
+            for ready in mp_connection.wait([conn, *running]):
+                if ready is conn:
+                    request = conn.recv()
+                    if request is None:
+                        return
+                    task_id, args = request
+                    receive, send = fork.Pipe(duplex=False)
+                    child = fork.Process(target=_simulate_and_save, args=(send, *args, network))
+                    child.start()
+                    send.close()  # the child holds the only writer, so its death ends the pipe
+                    running[receive] = (task_id, child)
+                else:
+                    task_id, child = running.pop(ready)
+                    try:
+                        outcome = ready.recv()
+                    except EOFError:
+                        child.join()
+                        outcome = ("died", f"exit code {child.exitcode}")
+                    else:
+                        child.join()
+                    ready.close()
+                    conn.send((task_id, outcome))
+    except (EOFError, OSError):
+        return  # the web process is gone
+    finally:
+        for _task_id, child in running.values():
+            child.kill()  # never leave orphans behind
+
+
+class SimulationHost:
+    """The web process's handle on one metro's host process."""
+
+    def __init__(self, city: str):
+        self.city = city
+        ctx = mp.get_context("spawn")
+        self._conn, host_end = ctx.Pipe()
+        # Not a daemon: a daemonic process may not start children.
+        self._proc = ctx.Process(target=_host_main, args=(host_end, city), name=f"simhost-{city}")
+        self._proc.start()
+        host_end.close()
+        self._lock = threading.Lock()
+        self._pending: Dict[int, Tuple[Future, str]] = {}
+        self._ids = itertools.count()
+        self.alive = True
+        threading.Thread(target=self._read, name=f"simhost-{city}", daemon=True).start()
+
+    def submit(self, cfg: dict, seed: int, condition: str, cancel_event, progress_q,
+               checkpoint: str) -> Future:
+        """Start one simulation; the Future resolves to its result without map data."""
+        fut: Future = Future()
+        fut.set_running_or_notify_cancel()
+        what = f"{cfg['city']} seed {seed} {condition}"
+        with self._lock:
+            if not self.alive:
+                fut.set_exception(SimulationProcessDied(f"{what}: simulation host for {self.city} is gone"))
+                return fut
+            task_id = next(self._ids)
+            self._pending[task_id] = (fut, what)
+            try:
+                self._conn.send((task_id, (cfg, seed, condition, cancel_event, progress_q, checkpoint)))
+            except OSError:
+                self._pending.pop(task_id)
+                fut.set_exception(SimulationProcessDied(f"{what}: simulation host for {self.city} is gone"))
+        return fut
+
+    def _read(self) -> None:
+        while True:
+            try:
+                task_id, (outcome, payload) = self._conn.recv()
+            except (EOFError, OSError):
+                break
+            with self._lock:
+                fut, what = self._pending.pop(task_id)
+            if outcome == "ok":
+                fut.set_result(payload)
+            elif outcome == "cancelled":
+                fut.set_exception(SimulationCancelled())
+            elif outcome == "died":
+                fut.set_exception(SimulationProcessDied(f"{what}: simulation process ended with {payload} without a result"))
+            else:
+                fut.set_exception(RuntimeError(f"{what}: {payload}"))
+        # The host has gone: whatever it was running will never report back.
+        with self._lock:
+            self.alive = False
+            lost, self._pending = list(self._pending.values()), {}
+        for fut, what in lost:
+            fut.set_exception(SimulationProcessDied(f"{what}: simulation host for {self.city} ended"))
+
+    def close(self) -> None:
+        with self._lock:
+            if self.alive:
+                try:
+                    self._conn.send(None)
+                except OSError:
+                    pass
+        self._proc.join(timeout=30)
+        if self._proc.is_alive():
+            self._proc.kill()
+            self._proc.join()
+
+
+class _HostRegistry:
+    """One live host per metro while any study of that metro runs."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._hosts: Dict[str, SimulationHost] = {}
+        self._users: Dict[str, int] = {}
+
+    def acquire(self, city: str) -> None:
+        """A study of ``city`` starts using its host (started, and its network's
+        memory reserved, on first use)."""
+        with self._lock:
+            if city not in self._hosts:
+                GOVERNOR.reserve_host(city, _host_memory_gb(city))
+                self._hosts[city] = SimulationHost(city)
+            self._users[city] = self._users.get(city, 0) + 1
+
+    def host(self, city: str) -> SimulationHost:
+        """The live host for ``city``; a host that died is replaced."""
+        with self._lock:
+            host = self._hosts[city]
+            if not host.alive:
+                host.close()
+                host = self._hosts[city] = SimulationHost(city)
+            return host
+
+    def release(self, city: str) -> None:
+        """A study of ``city`` is done with its host; the last one shuts it down."""
+        with self._lock:
+            self._users[city] -= 1
+            if self._users[city]:
+                return
+            del self._users[city]
+            host = self._hosts.pop(city)
+        host.close()
+        GOVERNOR.release_host(city)
+
+
+HOSTS = _HostRegistry()
 
 
 # ── Config / run records ─────────────────────────────────────────────────────
@@ -818,8 +1005,6 @@ def pois_available() -> Dict[str, bool]:
 
 
 # ── Worker: run ONE simulation (one seed, one condition) ─────────────────────
-#
-# Module-level so it is picklable by ProcessPoolExecutor.
 
 
 def _spec_for(cfg: dict, condition: str) -> Optional[RecommenderSpec]:
@@ -923,50 +1108,25 @@ def _agent_segments(sim) -> Dict[int, dict]:
     return {a.id: {**segments[a.id], "car_access": a.car_access_type} for a in sim.agents}
 
 
-class SimulationProcessDied(RuntimeError):
-    """A simulation's process ended without reporting back: killed (most likely
-    for memory) or crashed. The task can be retried."""
+def _die_with_host() -> None:
+    """Have the kernel kill this process the moment its host dies (Linux).
 
-
-def _run_one(cfg: dict, seed: int, condition: str, cancel_event, progress_q,
-             checkpoint: str) -> dict:
-    """Run one simulation in a child process of its own; return its result
-    without the map data (which the child saves to ``checkpoint``).
-
-    Pool workers are long-lived (Python 3.10's ProcessPoolExecutor cannot retire
-    them), and a Python process keeps most of the heap it has ever used, so a
-    worker that ran the simulation itself would hold its peak for good. A forked
-    child gives every byte back when it exits, whether the run finished, failed
-    or was cancelled. Forking is safe here: a pool worker is a spawned,
-    single-threaded process, and the cancel Event and progress Queue are manager
-    proxies, which reconnect in the child. Results are unchanged: the same code
-    in a fresh process.
+    A dead host's simulations are retried on a new one; left running, the old
+    ones would hold memory the governor has already released.
     """
-    ctx = mp.get_context("fork")
-    receive, send = ctx.Pipe(duplex=False)
-    child = ctx.Process(target=_simulate_and_save, name=f"sim-{condition}-{seed}",
-                        args=(send, cfg, seed, condition, cancel_event, progress_q, checkpoint))
-    child.start()
-    send.close()  # the child holds the only writer, so its death ends the pipe
     try:
-        outcome, payload = receive.recv()
-    except EOFError:
-        child.join()
-        raise SimulationProcessDied(
-            f"{cfg['city']} seed {seed} {condition}: simulation process ended with "
-            f"exit code {child.exitcode} without a result") from None
-    finally:
-        receive.close()
-    child.join()
-    if outcome == "cancelled":
-        raise SimulationCancelled()
-    if outcome == "error":
-        raise RuntimeError(payload)
-    return payload
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG
+    except (OSError, AttributeError):
+        return
+    if os.getppid() != _HOST_PID:  # the host died before the signal was armed
+        os._exit(1)
 
 
-def _simulate_and_save(conn, cfg, seed, condition, cancel_event, progress_q, checkpoint) -> None:
-    """Body of _run_one's child: simulate, save, report one (outcome, payload)."""
+def _simulate_and_save(conn, cfg, seed, condition, cancel_event, progress_q, checkpoint,
+                       network) -> None:
+    """Body of a simulation child (forked by its metro's host, see _host_main):
+    simulate on the host's network, save, report one (outcome, payload)."""
+    _die_with_host()
     try:
         # If memory does run out, the kernel should kill a simulation, which is
         # retried, rather than the web process, which holds every study.
@@ -975,7 +1135,7 @@ def _simulate_and_save(conn, cfg, seed, condition, cancel_event, progress_q, che
     except OSError:
         pass
     try:
-        res = _simulate(cfg, seed, condition, cancel_event, progress_q)
+        res = _simulate(cfg, seed, condition, cancel_event, progress_q, network)
         conn.send(("ok", _save_task_result(checkpoint, res)))
     except SimulationCancelled:
         conn.send(("cancelled", None))
@@ -986,7 +1146,7 @@ def _simulate_and_save(conn, cfg, seed, condition, cancel_event, progress_q, che
 
 
 def _simulate(cfg: dict, seed: int, condition: str, cancel_event=None,
-              progress_q=None) -> dict:
+              progress_q=None, network=None) -> dict:
     """Run ONE simulation: one condition at one seed. The unit of parallelism.
 
     Returns a picklable dict of that run's metrics, its per-agent utilities and
@@ -995,11 +1155,13 @@ def _simulate(cfg: dict, seed: int, condition: str, cancel_event=None,
     ``{agent_id: eval-day leisure utility}`` map back lets the parent do that
     pairing across process boundaries (one float per agent).
 
-    Raises SimulationCancelled if ``cancel_event`` is set between days.
+    Raises SimulationCancelled if ``cancel_event`` is set between days. ``network``
+    is the metro's network when the caller already holds it (a simulation host).
     """
     poi_rows = get_datasource().poi_rows(cfg["city"]) if bool(cfg["use_real_pois"]) else None
     use_real_pois = bool(poi_rows)
-    network = build_network(cfg["city"])  # metro two-layer or legacy preset
+    if network is None:
+        network = build_network(cfg["city"])  # metro two-layer or legacy preset
 
     # Cooperative cancellation: checked between days by the engine. `cancel_event`
     # is the study's manager Event, set when the study is cancelled or fails.
@@ -1376,6 +1538,9 @@ class RunManager:
                 return run_id, "running"
             job = Job(run_id=run_id, total=len(config.seeds()), config=config)
             self._jobs[run_id] = job
+            # Registered now, not when it starts running, so a batch submitted
+            # together shares memory fairly from its first simulation on.
+            GOVERNOR.register(run_id)
         self._executor.submit(self._execute, run_id, config)
         return run_id, "running"
 
@@ -1405,6 +1570,8 @@ class RunManager:
             job.error = f"{type(exc).__name__}: {exc}"
             job.finish("error")
             job.publish({"type": "error", "message": job.error})
+        finally:
+            GOVERNOR.unregister(run_id)
 
     def _build_study(self, run_id: str, cfg: RunConfig, job: Job) -> Run:
         seeds = cfg.seeds()
@@ -1433,11 +1600,6 @@ class RunManager:
                 job.current += num_days
                 job.per_condition[t[1]] += num_days
         tasks = [t for t in tasks if t not in results]
-
-        # Workers only load a warmed network from disk. An unwarmed one is built
-        # here once, so they never download it concurrently.
-        if tasks and not warmed_cities().get(cfg.city):
-            build_network(cfg.city)
 
         # Ticks arrive from every worker at once, so the counter needs a lock.
         # Publishing happens outside it to keep the SSE fan-out off the critical
@@ -1503,12 +1665,12 @@ class RunManager:
         drain = threading.Thread(target=_drain, name="progress", daemon=True)
         drain.start()
 
-        pool = shared_pool()
+        city = cfg_dict["city"]
         cost = {t: TaskCost(_task_memory_gb(cfg_dict, t[1]), t[1] == ORACLE) for t in tasks}
         pending = list(tasks)
         attempts = {t: 0 for t in tasks}
-        in_flight: Dict[object, Tuple[int, str]] = {}
-        GOVERNOR.register(run_id)
+        in_flight: Dict[Future, Tuple[int, str]] = {}
+        HOSTS.acquire(city)
 
         def _start_what_fits() -> None:
             for task in list(pending):
@@ -1516,14 +1678,8 @@ class RunManager:
                     continue
                 pending.remove(task)
                 attempts[task] += 1
-                try:
-                    fut = pool.submit(_run_one, cfg_dict, task[0], task[1], job.mp_cancel,
-                                      progress_q, checkpoint[task])
-                except (BrokenProcessPool, RuntimeError):
-                    GOVERNOR.release(run_id, cost[task])
-                    reset_shared_pool()
-                    raise
-                in_flight[fut] = task
+                in_flight[HOSTS.host(city).submit(cfg_dict, task[0], task[1], job.mp_cancel,
+                                                  progress_q, checkpoint[task])] = task
 
         def _finish(fut) -> Tuple[int, str]:
             task = in_flight.pop(fut)
@@ -1549,22 +1705,16 @@ class RunManager:
                         print(f"study {run_id}: {exc}; retrying "
                               f"(attempt {attempts[task] + 1} of {MAX_TASK_ATTEMPTS})", flush=True)
                         pending.insert(0, task)
-                    except BrokenProcessPool:
-                        reset_shared_pool()
-                        raise
         except BaseException:
             # Stop this study's simulations and wait for them to wind down
             # (within one simulated day), keeping their memory reserved until then.
             job.mp_cancel.set()
-            for fut in list(in_flight):
-                if fut.cancel():  # never started
-                    _finish(fut)
             wait(list(in_flight))
             raise
         finally:
             for fut in list(in_flight):
                 _finish(fut)
-            GOVERNOR.unregister(run_id)
+            HOSTS.release(city)
             stop_drain.set()
             drain.join(timeout=1.0)
             job.mp_cancel = None
