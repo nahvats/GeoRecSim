@@ -11,7 +11,8 @@ export interface RecommenderSpec {
   personalization_lambda: number;
   distance_scale_km: number;
   popularity_gamma: number;
-  learning_rate: number;
+  prior_strength: number;
+  exploration: number;
   /** "" | "pup" | "rm" | "pup_rm" */
   welfare_gate: string;
   pup_alpha: number;

@@ -33,7 +33,10 @@ class RecommenderSpecRequest(BaseModel):
     personalization_lambda: float = Field(0.10, ge=0.0, le=1.0)
     distance_scale_km: float = Field(5.0, gt=0.0, le=50.0)
     popularity_gamma: float = Field(1.0, ge=0.0, le=3.0)
-    learning_rate: float = Field(0.12, ge=0.0, le=1.0)
+    #: The user model: pseudo-observations an estimate starts from (smaller
+    #: learns from less), and the bonus for rarely shown kinds of venue.
+    prior_strength: float = Field(2.0, gt=0.0, le=50.0)
+    exploration: float = Field(0.10, ge=0.0, le=1.0)
     #: "" | "pup" | "rm" | "pup_rm" — the welfare gate applied on top.
     welfare_gate: str = ""
     pup_alpha: float = Field(params.WELFARE_GATE_DEFAULTS["pup_alpha"], ge=0.0, le=1.0)
@@ -55,7 +58,8 @@ class RecommenderSpecRequest(BaseModel):
             personalization_lambda=self.personalization_lambda,
             distance_scale_km=self.distance_scale_km,
             popularity_gamma=self.popularity_gamma,
-            learning_rate=self.learning_rate,
+            prior_strength=self.prior_strength,
+            exploration=self.exploration,
             welfare_gate=self.welfare_gate,
             pup_alpha=self.pup_alpha, rm_epsilon=self.rm_epsilon,
             random_ranking=self.random_ranking,

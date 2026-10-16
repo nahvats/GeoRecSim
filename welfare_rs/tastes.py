@@ -438,6 +438,16 @@ TASTE_SIMILARITY: Dict[str, Dict[str, Tuple[Tuple[str, ...], ...]]] = {
     },
 }
 
+#: Tags that mostly just name the category: "park" and "museum" outright, and
+#: "coffee" and "gym" through their "cafe" and "fitness" needles, which catch
+#: every "X Cafe" and "X Fitness". A venue carrying one says little about which
+#: kind of park, museum, café or gym it is. Matching is
+#: therefore one-directional for them. An agent whose taste is generic (it likes
+#: parks) earns the related share at a garden or a trail; an agent whose taste
+#: is specific (it likes trails) earns nothing extra at a venue known only as a
+#: park. Tastes may be broader than venues, never the other way round.
+GENERIC_TAGS = frozenset({"park", "museum", "coffee", "gym"})
+
 _CLOSE, _RELATED = 2, 1
 
 
@@ -467,12 +477,22 @@ def _similarity_levels() -> Dict[Tuple[str, str], int]:
 _SIMILARITY_LEVELS = _similarity_levels()
 
 
-def tag_similarity(a: str, b: str, close: float, related: float) -> float:
-    """Similarity of two taste tags in [0, 1] (see TASTE_SIMILARITY)."""
+def kind_similarity(a: str, b: str, close: float, related: float) -> float:
+    """How alike two kinds of venue are, in [0, 1], symmetric
+    (TASTE_SIMILARITY). What a recommender may know about its catalog."""
     if a == b:
         return 1.0
     level = _SIMILARITY_LEVELS.get((a, b), 0)
     return close if level == _CLOSE else related if level == _RELATED else 0.0
+
+
+def tag_similarity(want: str, tag: str, close: float, related: float) -> float:
+    """How well a venue tagged ``tag`` serves a taste for ``want``, in [0, 1]:
+    :func:`kind_similarity`, except that a generic venue tag (GENERIC_TAGS)
+    serves only the same generic taste."""
+    if tag in GENERIC_TAGS and want != tag:
+        return 0.0
+    return kind_similarity(want, tag, close, related)
 
 
 def taste_fit(

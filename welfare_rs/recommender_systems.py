@@ -214,31 +214,45 @@ class RecommenderSystem(ABC):
         name: str,
         catalog: Sequence[Place],
         dynamics: Optional[PlaceDynamics] = None,
-        learning_rate: Optional[float] = None,
-        keyword_discount: Optional[float] = None,
+        prior_strength: Optional[float] = None,
+        exploration: Optional[float] = None,
     ):
-        from . import params
+        from . import params, tastes
 
         fp = params.FEEDBACK_PARAMS
+        tp = params.TASTE_PARAMS
         self.name = name
         self.catalog = list(catalog)
         self.place_by_id = {p.place_id: p for p in self.catalog}
         # Shared live rating/review/popularity state; None falls back to the
         # static values baked into each Place.
         self.dynamics = dynamics
-        # How fast feedback moves the user model. Read from FEEDBACK_PARAMS
-        # rather than hardcoded at the call site, so it is one of the knobs a
-        # builder-defined recommender can actually set.
-        self.learning_rate = (
-            fp["rs_learning_rate"] if learning_rate is None else float(learning_rate)
+        # The user model (see _personalization_parts): per user, how often each
+        # place and each taste tag was shown and liked. Read from
+        # FEEDBACK_PARAMS rather than hardcoded, so a builder-defined
+        # recommender can set the two knobs that matter.
+        self.prior_strength = max(
+            1e-6, fp["rs_prior_strength"] if prior_strength is None else float(prior_strength)
         )
-        self.keyword_discount = (
-            fp["keyword_affinity_discount"]
-            if keyword_discount is None
-            else float(keyword_discount)
+        self.prior_like_rate = float(fp["rs_prior_like_rate"])
+        self.exploration = max(
+            0.0, fp["rs_exploration"] if exploration is None else float(exploration)
         )
-        self.user_place_affinity: Dict[int, Dict[str, float]] = {}
-        self.user_keyword_affinity: Dict[int, Dict[str, float]] = {}
+        self.place_weight = float(fp["rs_place_weight"])
+        self.user_place_counts: Dict[int, Dict[str, List[float]]] = {}
+        self.user_tag_counts: Dict[int, Dict[str, List[float]]] = {}
+        # Feedback on a tag also counts, partly, for similar tags in its family
+        # (tastes.TASTE_SIMILARITY): tag -> ((tag, similarity), ...), itself
+        # included. Venue-side knowledge, like a catalog's category tree: it
+        # says which kinds of venue resemble each other, nothing about the user.
+        close, related = tp["similarity_close"], tp["similarity_related"]
+        self._tag_neighbours: Dict[str, Tuple[Tuple[str, float], ...]] = {}
+        for vocab in tastes.TASTE_VOCAB.values():
+            for tag in vocab:
+                self._tag_neighbours[tag] = tuple(
+                    (other, s) for other in vocab
+                    if (s := tastes.kind_similarity(tag, other, close, related)) > 0.0
+                )
 
     # Effective prominence signals (dynamic when a PlaceDynamics is wired).
 
@@ -266,26 +280,54 @@ class RecommenderSystem(ABC):
             return []
         return [p for p in self.catalog if p.category in allowed]
 
-    def _personalization_score(self, user_id: int, place: Place) -> float:
-        """Return personalized score in [0, 1] from learned user affinities.
+    def _like_rate(self, counts: Optional[List[float]]) -> float:
+        """Estimated chance this user likes it: the like share, pulled toward
+        the prior like rate by ``prior_strength`` pseudo-observations, so a
+        single like or dislike does not read as certainty."""
+        m, p0 = self.prior_strength, self.prior_like_rate
+        if not counts:
+            return p0
+        shown, liked = counts
+        return (liked + m * p0) / (shown + m)
 
-        Two learned signals: affinity for this exact POI, and affinity for the
-        *kinds* of place it is (its taste tags). The second is what lets the
-        platform generalise — having liked two Thai restaurants it can favour a
-        third it has never sent anyone to. Tags, not ``keywords``: category
-        keywords are identical for every candidate in a subtype, so learning
-        them would only ever add a constant.
+    def _personalization_parts(self, user_id: int, place: Place) -> Tuple[float, float]:
+        """``(estimate, ranking score)`` of how much this user will like
+        ``place``, both in [0, 1] and 0.5-centred before any feedback.
+
+        Uğurel & Yabe (2026) Eq. 12's structure, ``Ω · place + (1 − Ω) · mean
+        over the place's tags``, with each affinity being the estimated like
+        rate (:meth:`_like_rate`) of this exact place or of that kind of place.
+        The tag part is what generalises: having liked two Thai restaurants,
+        the platform favours a third it has never sent anyone to.
+
+        The ranking score adds an exploration bonus to each tag,
+        ``exploration / sqrt(times shown + 1)`` (upper-confidence-bound style):
+        large for kinds of place this user has rarely been shown, shrinking as
+        evidence builds. Without it the ranking keeps showing the one kind of
+        venue that first came out on top and never learns about the others.
+        The estimate is the same quantity without the bonus, for whoever needs
+        a belief rather than a ranking (the welfare layer's V̂).
         """
-        place_affinity = self.user_place_affinity.get(user_id, {}).get(place.place_id, 0.0)
-        kw_aff = self.user_keyword_affinity.get(user_id, {})
+        place_rate = self._like_rate(self.user_place_counts.get(user_id, {}).get(place.place_id))
         if place.taste_tags:
-            kw_vals = [kw_aff.get(k.lower(), 0.0) for k in place.taste_tags]
-            kw_affinity = sum(kw_vals) / len(kw_vals)
+            tag_counts = self.user_tag_counts.get(user_id, {})
+            rates, bonuses = [], []
+            for tag in place.taste_tags:
+                counts = tag_counts.get(tag)
+                rates.append(self._like_rate(counts))
+                bonuses.append(self.exploration / math.sqrt((counts[0] if counts else 0.0) + 1.0))
+            tag_rate = sum(rates) / len(rates)
+            tag_bonus = sum(bonuses) / len(bonuses)
         else:
-            kw_affinity = 0.0
-        # place_affinity and kw_affinity are in [-1, 1]. Map to [0, 1].
-        combined = 0.6 * place_affinity + 0.4 * kw_affinity
-        return max(0.0, min(1.0, 0.5 * (combined + 1.0)))
+            tag_rate, tag_bonus = self.prior_like_rate, 0.0
+        omega = self.place_weight
+        estimate = omega * place_rate + (1.0 - omega) * tag_rate
+        ranking = min(1.0, estimate + (1.0 - omega) * tag_bonus)
+        return estimate, ranking
+
+    def _personalization_score(self, user_id: int, place: Place) -> float:
+        """Personalization component of the ranking, in [0, 1]."""
+        return self._personalization_parts(user_id, place)[1]
 
     def record_feedback(
         self,
@@ -293,30 +335,35 @@ class RecommenderSystem(ABC):
         place_id: str,
         liked: bool,
         feedback_strength: float = 1.0,
-        learning_rate: Optional[float] = None,
     ) -> None:
-        """Update user personalization state from feedback.
+        """Count one like or dislike for this place and its kinds of place.
 
-        ``learning_rate`` defaults to this recommender's own configured rate, so
-        a builder-defined recommender that learns fast or slow actually does.
+        Every feedback event counts once. ``feedback_strength`` is accepted for
+        the orchestrator interface and ignored: it sat at its floor for over 80%
+        of events, so it carried almost no information. The place's tags each
+        get a full observation, and every similar tag a fraction of one equal to
+        its similarity (the strongest, if the place has several tags).
         """
+        del feedback_strength
         place = self.place_by_id.get(place_id)
         if place is None:
             return
-        rate = self.learning_rate if learning_rate is None else learning_rate
-        delta = rate * max(0.2, min(2.0, feedback_strength))
-        if not liked:
-            delta *= -1.0
+        like = 1.0 if liked else 0.0
 
-        up = self.user_place_affinity.setdefault(user_id, {})
-        old_place = up.get(place_id, 0.0)
-        up[place_id] = max(-1.0, min(1.0, old_place + delta))
+        counts = self.user_place_counts.setdefault(user_id, {}).setdefault(place_id, [0.0, 0.0])
+        counts[0] += 1.0
+        counts[1] += like
 
-        uk = self.user_keyword_affinity.setdefault(user_id, {})
-        for keyword in place.taste_tags:
-            k = keyword.lower()
-            old_kw = uk.get(k, 0.0)
-            uk[k] = max(-1.0, min(1.0, old_kw + self.keyword_discount * delta))
+        weights: Dict[str, float] = {}
+        for tag in place.taste_tags:
+            for other, s in self._tag_neighbours.get(tag, ((tag, 1.0),)):
+                if s > weights.get(other, 0.0):
+                    weights[other] = s
+        tag_counts = self.user_tag_counts.setdefault(user_id, {})
+        for tag, w in weights.items():
+            c = tag_counts.setdefault(tag, [0.0, 0.0])
+            c[0] += w
+            c[1] += w * like
 
 
 class GoogleMapsReplica(RecommenderSystem):
@@ -515,10 +562,12 @@ class RecommenderConfig:
     #: demand on whatever is already winning. This is the dial on the
     #: rich-get-richer loop.
     popularity_gamma: float = 1.0
-    #: Feedback -> user-model step size, and the discount applied to tag
-    #: affinity relative to place affinity.
-    learning_rate: float = 0.12
-    keyword_discount: float = 0.70
+    #: The user model (RecommenderSystem._personalization_parts): how many
+    #: pseudo-observations at the prior like rate an estimate starts from —
+    #: smaller learns from less evidence — and the size of the bonus for kinds
+    #: of venue the user has rarely been shown.
+    prior_strength: float = 2.0
+    exploration: float = 0.10
     #: Uniform-random ranking, ignoring every weight above. The control arm.
     random_ranking: bool = False
 
@@ -601,8 +650,8 @@ class ConfigurableRecommender(RecommenderSystem):
             name=cfg.label,
             catalog=catalog,
             dynamics=dynamics,
-            learning_rate=cfg.learning_rate,
-            keyword_discount=cfg.keyword_discount,
+            prior_strength=cfg.prior_strength,
+            exploration=cfg.exploration,
         )
         self.config = cfg
         raw = {
@@ -739,6 +788,7 @@ class ConfigurableRecommender(RecommenderSystem):
 
         scored: List[Recommendation] = []
         for place in candidates:
+            taste_estimate, personalization = self._personalization_parts(user.user_id, place)
             components = {
                 "rating": self._rating_component(place),
                 "relevance": self._relevance_component(place, query_set, interest_set),
@@ -748,7 +798,10 @@ class ConfigurableRecommender(RecommenderSystem):
                     if popularity_by_id is not None
                     else 0.0
                 ),
-                "personalization": self._personalization_score(user.user_id, place),
+                "personalization": personalization,
+                # Not part of the score: the same belief without the
+                # exploration bonus, for the welfare layer.
+                "taste_estimate": taste_estimate,
             }
             base = (
                 self._random_score(user.user_id, place.place_id)

@@ -657,7 +657,8 @@ class RecommenderSpec:
     personalization_lambda: float = 0.10
     distance_scale_km: float = 5.0
     popularity_gamma: float = 1.0
-    learning_rate: float = 0.12
+    prior_strength: float = 2.0
+    exploration: float = 0.10
     welfare_gate: str = ""          # "" | "pup" | "rm" | "pup_rm"
     pup_alpha: float = params.WELFARE_GATE_DEFAULTS["pup_alpha"]
     rm_epsilon: float = params.WELFARE_GATE_DEFAULTS["rm_epsilon"]
@@ -676,7 +677,8 @@ class RecommenderSpec:
             personalization_lambda=self.personalization_lambda,
             distance_scale_km=self.distance_scale_km,
             popularity_gamma=self.popularity_gamma,
-            learning_rate=self.learning_rate,
+            prior_strength=self.prior_strength,
+            exploration=self.exploration,
             random_ranking=self.random_ranking,
         )
 
@@ -692,7 +694,8 @@ class RecommenderSpec:
             round(self.w_relevance, 4), round(self.w_proximity, 4),
             round(self.w_popularity, 4), round(self.personalization_lambda, 4),
             round(self.distance_scale_km, 4), round(self.popularity_gamma, 4),
-            round(self.learning_rate, 4), self.welfare_gate,
+            round(self.prior_strength, 4), round(self.exploration, 4),
+            self.welfare_gate,
             round(self.pup_alpha, 4), round(self.rm_epsilon, 4),
             bool(self.random_ranking),
         # Appended only when set, so every non-oracle spec keeps the identity,

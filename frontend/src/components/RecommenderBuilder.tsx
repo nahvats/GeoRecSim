@@ -53,7 +53,8 @@ export const BLANK_SPEC: RecommenderSpec = {
   personalization_lambda: 0.1,
   distance_scale_km: 5,
   popularity_gamma: 1,
-  learning_rate: 0.12,
+  prior_strength: 2,
+  exploration: 0.1,
   welfare_gate: "",
   // Defaults match welfare_rs.params.WELFARE_GATE_DEFAULTS (gating threshold study optima).
   pup_alpha: 0.3,
@@ -324,18 +325,32 @@ function SpecEditor({
           )}
 
           {spec.personalization_lambda > 0 && (
-            <label className="rec-field" title="How fast a like or dislike moves the platform's model of this agent. Feedback only arrives on accepted recommendations, so learning is slow — a longer study shows more of it.">
-              Learning rate: <b>{spec.learning_rate.toFixed(2)}</b>
-              <input
-                type="range"
-                min={0}
-                max={0.5}
-                step={0.01}
-                value={spec.learning_rate}
-                disabled={disabled}
-                onChange={(e) => onPatch({ learning_rate: parseFloat(e.target.value) })}
-              />
-            </label>
+            <>
+              <label className="rec-field" title="How much evidence the platform needs before it trusts what it has learned. Its estimate of how much an agent likes a kind of venue is the share of likes, starting from this many imaginary 50/50 observations — smaller learns from fewer likes and dislikes. Feedback only arrives on accepted recommendations, so learning is slow — a longer study shows more of it.">
+                Prior strength: <b>{spec.prior_strength.toFixed(1)}</b>
+                <input
+                  type="range"
+                  min={0.5}
+                  max={10}
+                  step={0.5}
+                  value={spec.prior_strength}
+                  disabled={disabled}
+                  onChange={(e) => onPatch({ prior_strength: parseFloat(e.target.value) })}
+                />
+              </label>
+              <label className="rec-field" title="How much the platform favours kinds of venue it has rarely shown this agent, so it can discover tastes it would otherwise never see. The bonus shrinks as a kind gets shown more. 0 never explores.">
+                Exploration: <b>{spec.exploration.toFixed(2)}</b>
+                <input
+                  type="range"
+                  min={0}
+                  max={0.5}
+                  step={0.01}
+                  value={spec.exploration}
+                  disabled={disabled}
+                  onChange={(e) => onPatch({ exploration: parseFloat(e.target.value) })}
+                />
+              </label>
+            </>
           )}
         </>
       )}

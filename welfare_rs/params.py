@@ -736,8 +736,17 @@ FEEDBACK_PARAMS: dict = {
     "sigmoid_scale": 1.25,
     "p_like_min": 0.05,
     "p_like_max": 0.95,
-    "rs_learning_rate": 0.12,
-    "keyword_affinity_discount": 0.70,
+    # The recommender's user model (RecommenderSystem._personalization_parts):
+    # per place and per taste tag, the like share, pulled toward
+    # rs_prior_like_rate by rs_prior_strength pseudo-observations; plus an
+    # exploration bonus rs_exploration / sqrt(times shown + 1) on each tag.
+    # rs_place_weight is Eq. 12's Omega (place vs tag affinity, 0.6 as in the
+    # paper). The prior like rate is 0.5, near the measured overall like rate
+    # (45-60%). Not estimated from data.
+    "rs_prior_strength": 2.0,
+    "rs_prior_like_rate": 0.5,
+    "rs_exploration": 0.10,
+    "rs_place_weight": 0.6,
     "feedback_strength_floor": 0.25,
     "feedback_strength_max": 2.0,
     "feedback_strength_min": 0.2,

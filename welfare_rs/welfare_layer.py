@@ -307,15 +307,17 @@ def estimate_activity_utility(rec: Recommendation, leisure_subtype: str) -> floa
     - the motivation terms are private to the agent and identical for every
       venue of a subtype, so they are left out — they cancel in the regret,
       and leave PUP's level slightly conservative;
-    - the taste bonus is ``match_bonus`` times the recommender's learned
-      personalization score P in [0, 1] (0.5 when it has learned nothing),
-      its only estimate of how well the venue fits the agent.
+    - the taste bonus is ``match_bonus`` times the recommender's estimate of
+      how much the agent will like the venue, in [0, 1] (0.5 when it has
+      learned nothing): ``taste_estimate``, its personalization belief without
+      the exploration bonus, or the personalization component for a
+      recommender that does not report one.
 
     The ranking score is deliberately not used: rating and popularity are not
     part of the agent's utility, and proximity already enters through Ĉ.
     """
     base = params.LEISURE_SEGMENTS.get(leisure_subtype, {}).get("activity_utility", 0.0)
-    fit = rec.components.get("personalization", 0.5)
+    fit = rec.components.get("taste_estimate", rec.components.get("personalization", 0.5))
     return base + params.TASTE_PARAMS["match_bonus"] * fit
 
 
