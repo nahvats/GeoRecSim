@@ -51,7 +51,7 @@ from .welfare_layer import (
     TravelCostEstimator,
     WelfareAwareOrchestrator,
     compute_continuous_feedback,
-    compute_expected_regret,
+    compute_regret,
     compute_pup,
 )
 
@@ -102,5 +102,5 @@ __all__ = [
     "ContinuousFeedback",
     "compute_continuous_feedback",
     "compute_pup",
-    "compute_expected_regret",
+    "compute_regret",
 ]

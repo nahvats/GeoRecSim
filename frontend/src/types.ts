@@ -4,11 +4,11 @@
 export interface RecommenderSpec {
   label: string;
   w_rating: number;
-  w_reviews: number;
   w_relevance: number;
   w_proximity: number;
   w_popularity: number;
-  w_personalization: number;
+  /** lambda of Eq. 11: the share of the score that is personalization, in [0, 1]. */
+  personalization_lambda: number;
   distance_scale_km: number;
   popularity_gamma: number;
   learning_rate: number;
@@ -19,14 +19,13 @@ export interface RecommenderSpec {
   random_ranking: boolean;
 }
 
-/** The six weighted components, in the order they are shown to the user. */
+/** The base-score components, in the order they are shown to the user. They
+ * renormalize among themselves; personalization is weighted by lambda outside them. */
 export const WEIGHT_KEYS = [
   "w_rating",
-  "w_reviews",
   "w_relevance",
   "w_proximity",
   "w_popularity",
-  "w_personalization",
 ] as const;
 export type WeightKey = (typeof WEIGHT_KEYS)[number];
 

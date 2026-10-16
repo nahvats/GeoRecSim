@@ -360,9 +360,21 @@ class Simulation:
         agent_tastes = getattr(agent, "tastes", None)
         if not agent_tastes:
             return 0.0
-        if tastes.taste_match(agent_tastes, place.taste_tags):
-            return float(params.TASTE_PARAMS["match_bonus"])
-        return 0.0
+        # The full bonus for an exact match, a share of it for a similar tag
+        # (italian taste, pizzeria): tastes.TASTE_SIMILARITY.
+        tp = params.TASTE_PARAMS
+        fit = tastes.taste_fit(agent_tastes, place.taste_tags,
+                               tp["similarity_close"], tp["similarity_related"])
+        return float(tp["match_bonus"]) * fit
+
+    def taste_matches(self, agent, place_id):
+        """True when ``place_id`` carries one of the agent's tastes exactly
+        (the taste-match metrics; similar tags do not count)."""
+        place = self.place_by_id.get(place_id) if place_id else None
+        agent_tastes = getattr(agent, "tastes", None)
+        if place is None or not place.taste_tags or not agent_tastes:
+            return False
+        return tastes.taste_match(agent_tastes, place.taste_tags)
 
     def realised_activity_utility(self, agent, subtype, place_id):
         """The activity benefit V a leisure trip is credited with on arrival.
@@ -2023,6 +2035,7 @@ class Simulation:
                 continuous_feedback,
                 travel_time_min=feedback_trip.travel_time_min,
                 monetary_cost=feedback_trip.cost,
+                mode=feedback_trip.mode,
             )
 
     # ── Day simulation ───────────────────────────────────────────────────────

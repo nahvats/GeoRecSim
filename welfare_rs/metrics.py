@@ -230,7 +230,7 @@ def taste_metrics(sim) -> Dict[str, float]:
         for trip in agent.trips:
             if trip.purpose != "leisure" or not trip.place_id:
                 continue
-            matched = 1 if sim.taste_bonus(agent, trip.place_id) > 0.0 else 0
+            matched = 1 if sim.taste_matches(agent, trip.place_id) else 0
             lane = "recommended" if trip.accepted_recommendation else "organic"
             for key in ("all", lane):
                 counters[key][0] += matched
@@ -348,7 +348,7 @@ class RunMetrics:
                     place = sim.place_by_id.get(trip.place_id)
                     if place is not None:
                         row[place.category] = row.get(place.category, 0) + 1
-                    matched = 1 if sim.taste_bonus(agent, trip.place_id) > 0.0 else 0
+                    matched = 1 if sim.taste_matches(agent, trip.place_id) else 0
                     lane = "recommended" if trip.accepted_recommendation else "organic"
                     for key in ("all", lane):
                         self.taste_pool[key][0] += matched

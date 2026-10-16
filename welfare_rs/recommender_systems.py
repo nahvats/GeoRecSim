@@ -480,30 +480,34 @@ class PopularityRecommender(RecommenderSystem):
         return scored[: max(1, top_k)]
 
 
-#: Review count treated as "as prominent as it gets". Fixed rather than
-#: min-maxed over the candidate set, so the reviews component means the same
-#: thing in every call and in every condition — see ConfigurableRecommender.
-REVIEW_REFERENCE = 5000.0
-
-
 @dataclass(frozen=True)
 class RecommenderConfig:
-    """A recommender the user built: six component weights and two shapes.
+    """A recommender the user built: four base weights, the personalization
+    weight lambda, and two shapes.
 
-    Weights are renormalized to sum to 1 at construction, and every component is
-    bounded in [0, 1], so the resulting score is in [0, 1] **for every
+    The score is Uğurel & Yabe (2026) Eq. 11, ``(1 - lambda) * B + lambda * P``:
+    ``B`` is the convex combination of the base components (their weights are
+    renormalized among themselves), ``P`` the learned personalization score.
+    Every component is bounded in [0, 1], so the score is in [0, 1] **for every
     configuration**. That is what makes scores comparable — see the class
     docstring of :class:`ConfigurableRecommender` for why the previous design
     was not.
+
+    There is no reviews component. The review count was a synthetic draw plus
+    one review per like or dislike, so the only part of it that moved during a
+    run was a count of accepted-recommendation visits: popularity filtered to
+    recommended trips, on a log scale where it barely moved at all.
     """
 
     label: str = "Custom RS"
     w_rating: float = 0.20
-    w_reviews: float = 0.15
     w_relevance: float = 0.10
     w_proximity: float = 0.25
     w_popularity: float = 0.20
-    w_personalization: float = 0.10
+    #: lambda of Eq. 11, in [0, 1]: the share of the score that is
+    #: personalization. Independent of the base weights, so moving a base
+    #: weight never changes it.
+    personalization_lambda: float = 0.10
     #: Proximity decays as exp(-d / distance_scale_km).
     distance_scale_km: float = 5.0
     #: Exponent on relative footfall. 0 ignores popularity entirely (the term
@@ -525,30 +529,35 @@ class RecommenderConfig:
 #: footfall term; "Footfall-led" (the OpenTable-style one) has no proximity
 #: term. That is exactly the design difference the two original classes
 #: encoded.
+#:
+#: Each preset's lambda is the personalization share it had when its six
+#: weights summed to one, so personalization keeps exactly the share it had.
+#: The base weights are the old ones with reviews dropped; they renormalize
+#: among themselves.
 RECOMMENDER_PRESETS: Dict[str, Dict[str, float]] = {
     "Proximity-led": {
-        "w_rating": 0.25, "w_reviews": 0.20, "w_relevance": 0.10,
-        "w_proximity": 0.35, "w_popularity": 0.00, "w_personalization": 0.10,
+        "w_rating": 0.25, "w_relevance": 0.10,
+        "w_proximity": 0.35, "w_popularity": 0.00, "personalization_lambda": 0.10,
         "distance_scale_km": 5.0, "popularity_gamma": 1.0,
     },
     "Footfall-led": {
-        "w_rating": 0.20, "w_reviews": 0.25, "w_relevance": 0.10,
-        "w_proximity": 0.00, "w_popularity": 0.35, "w_personalization": 0.10,
+        "w_rating": 0.20, "w_relevance": 0.10,
+        "w_proximity": 0.00, "w_popularity": 0.35, "personalization_lambda": 0.10,
         "distance_scale_km": 5.0, "popularity_gamma": 1.0,
     },
     "Balanced hybrid": {
-        "w_rating": 0.18, "w_reviews": 0.14, "w_relevance": 0.10,
-        "w_proximity": 0.25, "w_popularity": 0.18, "w_personalization": 0.15,
+        "w_rating": 0.18, "w_relevance": 0.10,
+        "w_proximity": 0.25, "w_popularity": 0.18, "personalization_lambda": 0.15,
         "distance_scale_km": 5.0, "popularity_gamma": 1.0,
     },
     "Personalized": {
-        "w_rating": 0.15, "w_reviews": 0.10, "w_relevance": 0.10,
-        "w_proximity": 0.20, "w_popularity": 0.10, "w_personalization": 0.35,
+        "w_rating": 0.15, "w_relevance": 0.10,
+        "w_proximity": 0.20, "w_popularity": 0.10, "personalization_lambda": 0.35,
         "distance_scale_km": 5.0, "popularity_gamma": 1.0,
     },
     "Viral": {
-        "w_rating": 0.10, "w_reviews": 0.10, "w_relevance": 0.05,
-        "w_proximity": 0.10, "w_popularity": 0.60, "w_personalization": 0.05,
+        "w_rating": 0.10, "w_relevance": 0.05,
+        "w_proximity": 0.10, "w_popularity": 0.60, "personalization_lambda": 0.05,
         "distance_scale_km": 5.0, "popularity_gamma": 2.0,
     },
     "Random": {"random_ranking": True},
@@ -556,10 +565,11 @@ RECOMMENDER_PRESETS: Dict[str, Dict[str, float]] = {
 
 
 class ConfigurableRecommender(RecommenderSystem):
-    """One scorer with six weighted components, each bounded in [0, 1].
+    """One scorer: four base components and personalization, each in [0, 1].
 
-    ``score = Σ wᵢ · cᵢ`` with ``Σ wᵢ = 1``, so the score is itself in [0, 1] no
-    matter how it is configured.
+    ``score = (1 - λ) · B + λ · P`` (Uğurel & Yabe 2026, Eq. 11), with
+    ``B = Σ wᵢ · cᵢ`` over the base components and ``Σ wᵢ = 1``, so the score is
+    itself in [0, 1] no matter how it is configured.
 
     That bound is the point. The two recommenders this replaces were not
     comparable: ``PopularityRecommender`` min-max normalized its output, so its
@@ -572,11 +582,11 @@ class ConfigurableRecommender(RecommenderSystem):
     Components:
 
     ``rating``          effective stars / 5 — moves as agents like and dislike.
-    ``reviews``         ``log1p(n) / log1p(REVIEW_REFERENCE)``, capped at 1.
     ``relevance``       category fit; near-constant within a subtype by design.
     ``proximity``       ``exp(-d / distance_scale_km)``, straight-line.
     ``popularity``      relative footfall ``(v / v_max) ** popularity_gamma``.
     ``personalization`` learned per-agent affinity, the only personal channel.
+                        Weighted by λ, outside the base combination.
     """
 
     def __init__(
@@ -597,20 +607,19 @@ class ConfigurableRecommender(RecommenderSystem):
         self.config = cfg
         raw = {
             "rating": max(0.0, cfg.w_rating),
-            "reviews": max(0.0, cfg.w_reviews),
             "relevance": max(0.0, cfg.w_relevance),
             "proximity": max(0.0, cfg.w_proximity),
             "popularity": max(0.0, cfg.w_popularity),
-            "personalization": max(0.0, cfg.w_personalization),
         }
         total = sum(raw.values())
-        # An all-zero weight vector would make every candidate score 0 and the
-        # ranking an artifact of catalog order; fall back to uniform.
-        self.weights = (
+        # An all-zero weight vector would make every candidate's base score 0
+        # and the ranking an artifact of catalog order; fall back to uniform.
+        self.base_weights = (
             {k: v / total for k, v in raw.items()}
             if total > 0
             else {k: 1.0 / len(raw) for k in raw}
         )
+        self.personalization_lambda = max(0.0, min(1.0, cfg.personalization_lambda))
         self.distance_scale_km = max(0.1, cfg.distance_scale_km)
         self.popularity_gamma = max(0.0, cfg.popularity_gamma)
         self.random_ranking = bool(cfg.random_ranking)
@@ -623,10 +632,6 @@ class ConfigurableRecommender(RecommenderSystem):
 
     def _rating_component(self, place: Place) -> float:
         return max(0.0, min(5.0, self._rating(place))) / 5.0
-
-    def _reviews_component(self, place: Place) -> float:
-        n = max(0, self._review_count(place))
-        return min(1.0, math.log1p(n) / math.log1p(REVIEW_REFERENCE))
 
     def _relevance_component(
         self, place: Place, query_set: frozenset, interest_set: frozenset
@@ -705,12 +710,14 @@ class ConfigurableRecommender(RecommenderSystem):
         popularity_by_id = self._popularity_components(candidates)
         query_set, interest_set = self._query_interest_sets(user, leisure_subtype)
 
-        # Score over the components that carry signal. On a cold start the
-        # popularity column does not exist yet, so its weight is redistributed
-        # across the rest rather than counted as a zero — keeping the score on
-        # the same [0, 1] scale for every configuration, which is what the
-        # cross-arm comparison and eta's quality term both depend on.
-        w = dict(self.weights)
+        # Base score over the components that carry signal. On a cold start
+        # the popularity column does not exist yet, so its weight is
+        # redistributed across the other base components rather than counted
+        # as a zero — keeping B, and so the score, on the same [0, 1] scale for
+        # every configuration, which is what the cross-arm comparison and eta's
+        # quality term both depend on. The redistribution stays inside B:
+        # lambda is the same on day one as on every other day.
+        w = dict(self.base_weights)
         cold_start_blind = False
         if popularity_by_id is None:
             popularity_weight = w.pop("popularity", 0.0)
@@ -718,22 +725,22 @@ class ConfigurableRecommender(RecommenderSystem):
             if remaining > 0:
                 w = {k: v / remaining for k, v in w.items()}
             elif popularity_weight > 0:
-                # A pure-popularity recommender before anyone has been anywhere
-                # has nothing whatsoever to rank on. Scoring every candidate
+                # A pure-popularity base before anyone has been anywhere has
+                # nothing whatsoever to rank on. Scoring every candidate
                 # equally is correct, but it cannot be left there: the sort
                 # below breaks ties on place_id, so every agent would be handed
                 # the same alphabetically-first POI, that POI would take the
                 # whole first day's footfall, and it would then lead the
                 # popularity term forever. The run would show massive
                 # concentration produced entirely by a tie-break. Fall back to
-                # the per-user random order until footfall exists.
+                # the per-user random order for B until footfall exists.
                 cold_start_blind = True
+        lam = self.personalization_lambda
 
         scored: List[Recommendation] = []
         for place in candidates:
             components = {
                 "rating": self._rating_component(place),
-                "reviews": self._reviews_component(place),
                 "relevance": self._relevance_component(place, query_set, interest_set),
                 "proximity": self._proximity_component(place, user),
                 "popularity": (
@@ -743,11 +750,12 @@ class ConfigurableRecommender(RecommenderSystem):
                 ),
                 "personalization": self._personalization_score(user.user_id, place),
             }
-            score = (
+            base = (
                 self._random_score(user.user_id, place.place_id)
                 if cold_start_blind
                 else sum(weight * components[k] for k, weight in w.items())
             )
+            score = (1.0 - lam) * base + lam * components["personalization"]
             scored.append(
                 Recommendation(
                     source=self.name, place=place, score=score, components=components

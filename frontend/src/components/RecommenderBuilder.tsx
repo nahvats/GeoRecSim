@@ -8,19 +8,17 @@ import { WEIGHT_KEYS } from "../types";
  * Every recommender in a study is the *same* scorer with different knob values;
  * a preset seeds the sliders and the user takes it from there. Weights are shown
  * as the percentages they normalize to rather than as their raw values, because
- * the raw numbers are meaningless on their own — the engine renormalizes them —
- * and a slider that reads "0.35" next to five others is impossible to reason
- * about, while "34% of the ranking" is not.
+ * the raw base weights are meaningless on their own — the engine renormalizes
+ * them — and a slider that reads "0.35" next to three others is impossible to
+ * reason about, while "34% of the ranking" is not. Personalization is the
+ * exception: its slider is lambda of Eq. 11, the share of the score it gets,
+ * and the base components share the rest.
  */
 
 const WEIGHT_LABELS: Record<WeightKey, { name: string; help: string }> = {
   w_rating: {
     name: "Rating",
     help: "The POI's star rating. Rises and falls as agents like or dislike it, so it is a slow feedback channel.",
-  },
-  w_reviews: {
-    name: "Reviews",
-    help: "How many reviews the POI has, on a log scale. A proxy for established reputation.",
   },
   w_relevance: {
     name: "Relevance",
@@ -34,11 +32,10 @@ const WEIGHT_LABELS: Record<WeightKey, { name: string; help: string }> = {
     name: "Popularity",
     help: "Live footfall relative to the busiest candidate. This is the feedback loop: visits make a place more recommendable, which brings more visits.",
   },
-  w_personalization: {
-    name: "Personalization",
-    help: "What the platform has learned this agent likes, from their past feedback. The only channel carrying anything agent-specific — and the only way it can ever discover an agent's latent taste.",
-  },
 };
+
+const PERSONALIZATION_HELP =
+  "λ: the share of the score that is what the platform has learned this agent likes, from their past feedback. The only channel carrying anything agent-specific — and the only way it can ever discover an agent's latent taste. The base components above share the rest.";
 
 const GATES: { value: string; label: string }[] = [
   { value: "", label: "None" },
@@ -50,11 +47,10 @@ const GATES: { value: string; label: string }[] = [
 export const BLANK_SPEC: RecommenderSpec = {
   label: "Custom RS",
   w_rating: 0.2,
-  w_reviews: 0.15,
   w_relevance: 0.1,
   w_proximity: 0.25,
   w_popularity: 0.2,
-  w_personalization: 0.1,
+  personalization_lambda: 0.1,
   distance_scale_km: 5,
   popularity_gamma: 1,
   learning_rate: 0.12,
@@ -65,12 +61,19 @@ export const BLANK_SPEC: RecommenderSpec = {
   random_ranking: false,
 };
 
-/** Weight shares as the engine will compute them, so the UI cannot disagree. */
+/** Personalization's share of the score (lambda), clamped as the engine does. */
+export function personalizationShare(spec: RecommenderSpec): number {
+  return Math.min(1, Math.max(0, spec.personalization_lambda));
+}
+
+/** Each base component's share of the whole score as the engine will compute
+ * it — (1 − λ) times its share of the base — so the UI cannot disagree. */
 export function normalizedWeights(spec: RecommenderSpec): Record<WeightKey, number> {
   const total = WEIGHT_KEYS.reduce((sum, k) => sum + Math.max(0, spec[k]), 0);
+  const rest = 1 - personalizationShare(spec);
   const out = {} as Record<WeightKey, number>;
   for (const k of WEIGHT_KEYS) {
-    out[k] = total > 0 ? Math.max(0, spec[k]) / total : 1 / WEIGHT_KEYS.length;
+    out[k] = rest * (total > 0 ? Math.max(0, spec[k]) / total : 1 / WEIGHT_KEYS.length);
   }
   return out;
 }
@@ -79,11 +82,14 @@ export function normalizedWeights(spec: RecommenderSpec): Record<WeightKey, numb
 export function specSummary(spec: RecommenderSpec): string {
   if (spec.random_ranking) return "uniform random · control";
   const w = normalizedWeights(spec);
-  const top = WEIGHT_KEYS.map((k) => ({ k, v: w[k] }))
+  const top = [
+    ...WEIGHT_KEYS.map((k) => ({ name: WEIGHT_LABELS[k].name, v: w[k] })),
+    { name: "Personalization", v: personalizationShare(spec) },
+  ]
     .sort((a, b) => b.v - a.v)
     .filter((x) => x.v > 0.01)
     .slice(0, 3)
-    .map((x) => `${WEIGHT_LABELS[x.k].name} ${Math.round(x.v * 100)}%`);
+    .map((x) => `${x.name} ${Math.round(x.v * 100)}%`);
   const extra: string[] = [];
   if (spec.w_popularity > 0 && spec.popularity_gamma !== 1) {
     extra.push(`γ ${spec.popularity_gamma.toFixed(1)}`);
@@ -266,6 +272,22 @@ function SpecEditor({
             </label>
           ))}
 
+          <label className="rec-weight" title={PERSONALIZATION_HELP}>
+            <span className="rec-weight-head">
+              <span>Personalization λ</span>
+              <b>{Math.round(personalizationShare(spec) * 100)}%</b>
+            </span>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.01}
+              value={spec.personalization_lambda}
+              disabled={disabled}
+              onChange={(e) => onPatch({ personalization_lambda: parseFloat(e.target.value) })}
+            />
+          </label>
+
           <label className="rec-field" title="Proximity decays as exp(-distance / scale). Smaller keeps agents local; larger makes the recommender willing to send them across the metro.">
             Distance scale: <b>{spec.distance_scale_km.toFixed(1)} km</b>
             <input
@@ -301,7 +323,7 @@ function SpecEditor({
             </label>
           )}
 
-          {spec.w_personalization > 0 && (
+          {spec.personalization_lambda > 0 && (
             <label className="rec-field" title="How fast a like or dislike moves the platform's model of this agent. Feedback only arrives on accepted recommendations, so learning is slow — a longer study shows more of it.">
               Learning rate: <b>{spec.learning_rate.toFixed(2)}</b>
               <input

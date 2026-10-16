@@ -334,3 +334,164 @@ def taste_match(
     if not wanted:
         return False
     return any(tag in wanted for tag in place_tags)
+
+
+# ── Taste similarity ─────────────────────────────────────────────────────────
+#
+# An exact tag match is not the only way a venue can suit an agent: someone who
+# loves Italian food also gets something from a pizzeria. Pairs of tags in the
+# same family are graded at three levels:
+#
+#   same tag   1
+#   close      TASTE_PARAMS["similarity_close"]    the tag is a dish or style of
+#                                                  the other: substitutes
+#   related    TASTE_PARAMS["similarity_related"]  the same broad tradition or
+#                                                  kind of outing
+#   otherwise  0, and always 0 across families.
+#
+# Hand-built over THIS vocabulary, so it is read against what each tag's
+# needles actually catch (TASTE_VOCAB), not against the tag's name: "halal"
+# also catches mediterranean, kosher, shawarma and falafel; "japanese" catches
+# ramen and udon; "noodle" catches pho and dumplings; "steak" catches every
+# "grill"; "juice" catches boba and tea houses; "park" is the generic tag most
+# parks get. Pairs are kept to the defensible ones: a missing link only leaves
+# a pair at today's exact-match behaviour, while a wrong one invents a
+# preference. POI-name co-occurrence was checked as a data source and rejected
+# (it is dominated by naming conventions such as "Bar & Grill" -> bar + steak);
+# its genuine pairs (italian-pizza, japanese-sushi, korean-bbq, coffee-tea,
+# juice-tea, art/history-museum) all appear below.
+#
+# ``groups`` relate every pair of their members; ``close`` and ``related`` list
+# pairs. A pair's level is the strongest that applies.
+
+TASTE_SIMILARITY: Dict[str, Dict[str, Tuple[Tuple[str, ...], ...]]] = {
+    "dining": {
+        "close": (
+            ("italian", "pizza"),     # pizza is an Italian dish; pizzerias call themselves Italian
+            ("japanese", "sushi"),    # sushi is a Japanese cuisine
+        ),
+        "groups": (
+            # East and Southeast Asian.
+            ("chinese", "japanese", "sushi", "korean", "thai", "noodle"),
+            # American casual and meat-centred: burger joints, wings and fried
+            # chicken, barbecue, steak and grill houses, delis.
+            ("burger", "chicken", "bbq", "steak", "deli"),
+        ),
+        "related": (
+            ("indian", "halal"),      # South Asian and Middle Eastern: kebab, biryani, halal meat
+            ("korean", "bbq"),        # Korean barbecue
+            ("sushi", "seafood"),     # raw fish and shellfish
+        ),
+        # mexican, vegan and bar have no close neighbour in this vocabulary.
+    },
+    "cafe": {
+        "close": (
+            ("coffee", "tea"),        # hot-drink cafés; coffee houses serve chai and matcha
+            ("juice", "tea"),         # "juice" catches boba, bubble tea and tea houses
+            ("bakery", "dessert"),    # sweet shops: pastry and cake, ice cream and chocolate
+        ),
+        "related": (
+            ("coffee", "bakery"),     # coffee with pastry
+            ("coffee", "juice"),      # drinks
+            ("dessert", "juice"),     # sweet cold treats: frozen yogurt, smoothies, acai
+        ),
+    },
+    "fitness": {
+        "related": (
+            ("yoga", "dance"),        # barre is in yoga, ballet in dance
+            ("yoga", "cycle"),        # boutique studio classes
+            ("dance", "cycle"),       # boutique studio classes
+            ("gym", "cycle"),         # cardio
+            ("gym", "combat"),        # boxing gyms
+            ("gym", "climb"),         # climbing gyms
+            ("gym", "swim"),          # athletic clubs with pools
+            ("swim", "tennis"),       # sports and racquet clubs
+        ),
+    },
+    "outdoor": {
+        "related": (
+            ("park", "garden"),       # green space
+            ("park", "trail"),        # greenways, preserves
+            ("park", "playground"),   # recreation grounds and fields sit in parks
+            ("park", "waterfront"),   # esplanades, riverside parks
+            ("trail", "waterfront"),  # riverside greenways
+            ("garden", "trail"),      # arboretums, preserves
+        ),
+        # zoo (zoos, aquariums, wildlife centres) stands apart.
+    },
+    "culture": {
+        "related": (
+            ("museum", "art"),        # "museum" is the generic tag: any museum
+            ("museum", "history"),
+            ("museum", "science"),
+            ("history", "science"),   # natural history is in science
+        ),
+    },
+    "music": {
+        "related": (
+            ("jazz", "club"),         # jazz clubs
+            ("jazz", "concert"),      # live music
+            ("concert", "club"),      # popular-music nights
+            ("concert", "orchestra"), # concert halls
+            ("theater", "orchestra"), # opera, ballet and symphony: the performing arts
+        ),
+    },
+}
+
+_CLOSE, _RELATED = 2, 1
+
+
+def _similarity_levels() -> Dict[Tuple[str, str], int]:
+    """(tag, tag) -> level, both orders, validated against TASTE_VOCAB."""
+    levels: Dict[Tuple[str, str], int] = {}
+
+    def put(family: str, a: str, b: str, level: int) -> None:
+        vocab = TASTE_VOCAB[family]
+        if a not in vocab or b not in vocab or a == b:
+            raise ValueError(f"taste similarity: bad pair {family}:{a}-{b}")
+        for pair in ((a, b), (b, a)):
+            levels[pair] = max(levels.get(pair, 0), level)
+
+    for family, spec in TASTE_SIMILARITY.items():
+        for group in spec.get("groups", ()):
+            for i, a in enumerate(group):
+                for b in group[i + 1:]:
+                    put(family, a, b, _RELATED)
+        for a, b in spec.get("related", ()):
+            put(family, a, b, _RELATED)
+        for a, b in spec.get("close", ()):
+            put(family, a, b, _CLOSE)
+    return levels
+
+
+_SIMILARITY_LEVELS = _similarity_levels()
+
+
+def tag_similarity(a: str, b: str, close: float, related: float) -> float:
+    """Similarity of two taste tags in [0, 1] (see TASTE_SIMILARITY)."""
+    if a == b:
+        return 1.0
+    level = _SIMILARITY_LEVELS.get((a, b), 0)
+    return close if level == _CLOSE else related if level == _RELATED else 0.0
+
+
+def taste_fit(
+    agent_tastes: Mapping[str, Sequence[str]],
+    place_tags: Iterable[str],
+    close: float,
+    related: float,
+) -> float:
+    """How well a place suits an agent, in [0, 1]: the best similarity between
+    any taste the agent holds and any tag the place carries. 1 for an exact
+    match, as :func:`taste_match`; with ``close = related = 0`` the two agree
+    exactly."""
+    wanted = [tag for tags in agent_tastes.values() for tag in tags]
+    best = 0.0
+    for tag in place_tags:
+        for want in wanted:
+            s = tag_similarity(want, tag, close, related)
+            if s > best:
+                best = s
+                if best >= 1.0:
+                    return 1.0
+    return best

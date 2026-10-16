@@ -17,18 +17,20 @@ class RecommenderSpecRequest(BaseModel):
     """One recommender the user built in the sidebar.
 
     Every field is a knob on the *same* scorer — the platforms differ by which
-    weights they zero out, not by having different machinery. Weights need not
-    sum to anything: they are renormalized engine-side, so the sliders can move
-    independently and the UI can show the resulting percentages.
+    weights they zero out, not by having different machinery. The base weights
+    need not sum to anything: they are renormalized among themselves
+    engine-side, so the sliders can move independently and the UI can show the
+    resulting percentages. ``personalization_lambda`` is not renormalized: it
+    is the share of the score that is personalization (Eq. 11).
     """
 
     label: str = Field("Custom RS", min_length=1, max_length=40)
     w_rating: float = Field(0.20, ge=0.0, le=1.0)
-    w_reviews: float = Field(0.15, ge=0.0, le=1.0)
     w_relevance: float = Field(0.10, ge=0.0, le=1.0)
     w_proximity: float = Field(0.25, ge=0.0, le=1.0)
     w_popularity: float = Field(0.20, ge=0.0, le=1.0)
-    w_personalization: float = Field(0.10, ge=0.0, le=1.0)
+    #: lambda of Eq. 11: the share of the score that is personalization.
+    personalization_lambda: float = Field(0.10, ge=0.0, le=1.0)
     distance_scale_km: float = Field(5.0, gt=0.0, le=50.0)
     popularity_gamma: float = Field(1.0, ge=0.0, le=3.0)
     learning_rate: float = Field(0.12, ge=0.0, le=1.0)
@@ -47,10 +49,10 @@ class RecommenderSpecRequest(BaseModel):
     def to_spec(self) -> RecommenderSpec:
         return RecommenderSpec(
             label=self.label.strip() or "Custom RS",
-            w_rating=self.w_rating, w_reviews=self.w_reviews,
+            w_rating=self.w_rating,
             w_relevance=self.w_relevance, w_proximity=self.w_proximity,
             w_popularity=self.w_popularity,
-            w_personalization=self.w_personalization,
+            personalization_lambda=self.personalization_lambda,
             distance_scale_km=self.distance_scale_km,
             popularity_gamma=self.popularity_gamma,
             learning_rate=self.learning_rate,

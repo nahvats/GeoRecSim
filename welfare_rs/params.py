@@ -771,6 +771,13 @@ TASTE_PARAMS: dict = {
     # feedback and welfare, not enough to swamp the travel-cost trade-off that
     # the spatial metrics measure.
     "match_bonus": 0.15,
+    # Share of match_bonus a venue earns when its tag is similar to the agent's
+    # taste rather than equal to it (welfare_rs.tastes.TASTE_SIMILARITY):
+    # "close" pairs are substitutes (italian-pizza), "related" pairs share a
+    # broad tradition (thai-chinese). Not estimated from data — set both to 0
+    # to recover exact-match tastes.
+    "similarity_close": 0.6,
+    "similarity_related": 0.3,
     # Tempering exponent on the supply-derived taste distribution. Weights go as
     # ``share ** beta``: 1.0 tracks the observed venue mix exactly, 0.0 is
     # uniform. Below 1 flattens the head, correcting the two biases that inflate
@@ -1233,6 +1240,12 @@ SIM_DEFAULTS: dict = {
 # 10 seeds). PUP peaks at alpha 0.3 (utility 0.293, 5% abstention; flat from 0.1
 # to 0.6). RM epsilon is the 75th percentile of Standard RS's expected regret, the
 # best of the calibrated grid (0.288, 8% abstention; p80 is within 0.001).
+# STALE, both of them. They were calibrated on the old welfare layer, which
+# priced travel in dollars (8x the agent's utility scale), estimated V from the
+# ranking score, and gated only the agent's top-3 list. The gates now use the
+# agent's utility formula in utility units over the whole candidate pool, and RM
+# uses the paper's Eq. 18 regret (shortfall from the best candidate). Re-set
+# both from re-run sweeps.
 WELFARE_GATE_DEFAULTS: dict = {
     "pup_alpha": 0.3,
     "rm_epsilon": 0.2550,

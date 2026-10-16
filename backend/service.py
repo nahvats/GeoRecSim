@@ -651,11 +651,10 @@ class RecommenderSpec:
 
     label: str = "Custom RS"
     w_rating: float = 0.20
-    w_reviews: float = 0.15
     w_relevance: float = 0.10
     w_proximity: float = 0.25
     w_popularity: float = 0.20
-    w_personalization: float = 0.10
+    personalization_lambda: float = 0.10
     distance_scale_km: float = 5.0
     popularity_gamma: float = 1.0
     learning_rate: float = 0.12
@@ -671,10 +670,10 @@ class RecommenderSpec:
     def to_engine_config(self) -> RecommenderConfig:
         return RecommenderConfig(
             label=self.label,
-            w_rating=self.w_rating, w_reviews=self.w_reviews,
+            w_rating=self.w_rating,
             w_relevance=self.w_relevance, w_proximity=self.w_proximity,
             w_popularity=self.w_popularity,
-            w_personalization=self.w_personalization,
+            personalization_lambda=self.personalization_lambda,
             distance_scale_km=self.distance_scale_km,
             popularity_gamma=self.popularity_gamma,
             learning_rate=self.learning_rate,
@@ -689,9 +688,9 @@ class RecommenderSpec:
         """
         return (
             self.label,
-            round(self.w_rating, 4), round(self.w_reviews, 4),
+            round(self.w_rating, 4),
             round(self.w_relevance, 4), round(self.w_proximity, 4),
-            round(self.w_popularity, 4), round(self.w_personalization, 4),
+            round(self.w_popularity, 4), round(self.personalization_lambda, 4),
             round(self.distance_scale_km, 4), round(self.popularity_gamma, 4),
             round(self.learning_rate, 4), self.welfare_gate,
             round(self.pup_alpha, 4), round(self.rm_epsilon, 4),
@@ -978,10 +977,10 @@ def _make_recommender_factory(spec: Optional[RecommenderSpec]):
     pup_alpha = spec.pup_alpha
     rm_epsilon = spec.rm_epsilon
 
-    def factory(_sim, base_stack):
+    def factory(sim, base_stack):
         return WelfareAwareOrchestrator(
             base_stack,
-            TravelCostEstimator(),
+            TravelCostEstimator(metro=sim.metro),
             mode=mode,
             pup_alpha=pup_alpha,
             rm_epsilon=rm_epsilon,

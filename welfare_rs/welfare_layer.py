@@ -11,6 +11,8 @@ Implements:
 from __future__ import annotations
 
 import math
+import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -21,14 +23,6 @@ from .recommender_systems import (
     UserContext,
 )
 from .utils import haversine_km
-
-
-DEFAULT_SCORE_TO_UTILITY_MODE = "subtype_base_plus_score"
-LEGACY_SCORE_TO_UTILITY_MODE = "identity"
-DEFAULT_SCORE_UTILITY_SCALE = max(
-    seg.get("activity_utility", 0.0)
-    for seg in params.LEISURE_SEGMENTS.values()
-)
 
 
 # ── Continuous feedback ──────────────────────────────────────────────────────
@@ -108,29 +102,63 @@ def compute_continuous_feedback(
 # ── Travel cost estimation ───────────────────────────────────────────────────
 
 class TravelCostEstimator:
-    """Learns per-user travel cost parameters from feedback history.
+    """The platform's estimate of a trip's travel cost, learned per user.
 
-    Maintains running estimates of:
-    - β̂_i^time: user's marginal disutility of travel time ($/min)
-    - β̂_i^cost: user's marginal disutility of monetary cost ($/$ spent)
-    - v̂_i: user's revealed value of time ($/hr)
+    Prices a candidate with the agent's own generalised-cost formula
+    (Simulation._base_mode_utility), divided by ``gen_cost_denominator`` so it
+    is in the same utility units as the activity benefit:
 
-    Uses exponential moving average over realized trip costs.
+        Ĉ = ((τ̂ / 60) · v̂ + κ̂) / gen_cost_denominator
+
+    What the platform cannot observe is estimated:
+
+    - distance: straight-line km to the venue (the platform does not route);
+    - mode: the mode this user took most often on the trips it has seen
+      (``default_mode`` until it has seen one);
+    - τ̂: that distance at the mode's speed, plus its wait;
+    - κ̂: the mode's money cost over that distance (the metro's metered fare
+      for a taxi, at the full fare);
+    - v̂: the user's value of time, learned from feedback (below);
+    - the time/cost weights and the trip-burden multiplier: 1, the population
+      mean.
+
+    Value of time is updated from continuous feedback: dissatisfaction with a
+    long trip raises it 5%, satisfaction with one lowers it 3% (paper B.3).
     """
 
-    def __init__(self, default_vot: float = 15.0, learning_rate: float = 0.15):
+    def __init__(
+        self,
+        default_vot: float = 15.0,
+        learning_rate: float = 0.15,
+        metro: Optional[str] = None,
+        default_mode: str = "car",
+    ):
         self.default_vot = default_vot
         self.learning_rate = learning_rate
-        # Per-user state: {user_id: {"vot": float, "avg_travel_cost": float, "n": int}}
+        self.metro = metro
+        self.default_mode = default_mode
+        # Per-user state: {user_id: {"vot": float, "avg_travel_cost": float,
+        # "n": int, "modes": Counter}}
         self.user_estimates: Dict[int, Dict[str, float]] = {}
 
-    def update(self, feedback: ContinuousFeedback, travel_time_min: float, monetary_cost: float) -> None:
-        """Update user travel cost estimates from a feedback observation."""
+    def update(
+        self,
+        feedback: ContinuousFeedback,
+        travel_time_min: float,
+        monetary_cost: float,
+        mode: Optional[str] = None,
+    ) -> None:
+        """Update user travel cost estimates from a feedback observation.
+
+        ``mode`` is how the user travelled to the venue, which a platform that
+        sent them there observes."""
         state = self.user_estimates.setdefault(
             feedback.user_id,
-            {"vot": self.default_vot, "avg_travel_cost": 0.0, "n": 0},
+            {"vot": self.default_vot, "avg_travel_cost": 0.0, "n": 0, "modes": Counter()},
         )
         state["n"] += 1
+        if mode:
+            state["modes"][mode] += 1
         alpha = self.learning_rate
 
         # Update average travel cost with EMA
@@ -146,26 +174,53 @@ class TravelCostEstimator:
             # User liked a long trip → they don't mind travel as much
             state["vot"] = max(5.0, state["vot"] * (1 - 0.03 * feedback.satisfaction))
 
-    def estimate_travel_cost(
-        self,
-        user_id: int,
-        distance_km: float,
-        avg_speed_kmh: float = 20.0,
-        cost_per_km: float = 0.15,
-    ) -> float:
-        """Estimate generalized travel cost for a user-place pair.
-
-        Returns Ĉ^travel_{ik} = β̂_i^time · τ̂ + β̂_i^cost · κ̂
-        """
+    def estimated_mode(self, user_id: int) -> str:
+        """The mode this user took most often on the trips the platform saw
+        (ties to the earliest seen), or ``default_mode`` before any."""
         state = self.user_estimates.get(user_id)
-        if state is None:
-            vot = self.default_vot
-        else:
-            vot = state["vot"]
+        modes = state.get("modes") if state else None
+        if not modes:
+            return self.default_mode
+        return modes.most_common(1)[0][0]
 
-        travel_time_hr = distance_km / max(1.0, avg_speed_kmh)
-        monetary_cost = distance_km * cost_per_km
-        return vot * travel_time_hr + monetary_cost
+    def _money(self, mode: str, distance_km: float, in_vehicle_min: float) -> float:
+        """Money cost of ``mode`` over ``distance_km``, as the agent is charged."""
+        if mode == "taxi":
+            tariff = params.TAXI_FARES.get(self.metro) or params.TAXI_FARES["default"]
+            miles = distance_km / 1.609344
+            fare = tariff["flag"] + tariff["per_mile"] * miles
+            first = tariff.get("first_mile_per_mile")
+            if first is not None:
+                fare += (first - tariff["per_mile"]) * min(miles, 1.0)
+            return fare
+        spec = params.MODE_PARAMS[mode]
+        money = spec["fixed_cost"] + spec["cost_per_km"] * distance_km
+        overage = spec.get("overage_per_min", 0.0)
+        if overage:
+            money += overage * max(0.0, in_vehicle_min - spec.get("included_min", 0.0))
+        return money
+
+    def estimate_travel_cost(self, user_id: int, distance_km: float) -> float:
+        """Ĉ^travel_{ik} in utility units, for a venue ``distance_km`` away in a
+        straight line (see the class docstring)."""
+        return self.estimate_travel_costs(user_id, (distance_km,))[0]
+
+    def estimate_travel_costs(self, user_id: int, distances_km: Sequence[float]) -> List[float]:
+        """:meth:`estimate_travel_cost` for many venues at once: the user's mode
+        and value of time are looked up once, not once per venue."""
+        state = self.user_estimates.get(user_id)
+        vot = self.default_vot if state is None else state["vot"]
+        mode = self.estimated_mode(user_id)
+        spec = params.MODE_PARAMS[mode]
+        per_min = vot / 60.0
+        speed = spec["speed_kmh"]
+        wait = spec["wait_min"]
+        denom = params.UTILITY_WEIGHTS["gen_cost_denominator"]
+        out = []
+        for d in distances_km:
+            in_vehicle_min = d / speed * 60.0
+            out.append(((in_vehicle_min + wait) * per_min + self._money(mode, d, in_vehicle_min)) / denom)
+        return out
 
     def get_user_vot(self, user_id: int) -> float:
         """Return estimated VOT for a user."""
@@ -220,73 +275,48 @@ def compute_pup(
     return _normal_cdf(z)
 
 
-def compute_expected_regret(
-    v_hat_act: float,
-    c_hat_travel: float,
-    sigma_i: float,
-    best_known_utility: float = 0.0,
-) -> float:
-    """Compute expected regret for a recommendation.
+def compute_regret(u_hat: float, candidate_u_hats: Sequence[float]) -> float:
+    """Estimated regret of recommending a candidate (Uğurel & Yabe 2026, Eq. 18).
 
-    E[R_{ik}] = E[max(0, U* - U_{ik})]
-
-    For a normal approximation:
-    E[R] = σ · φ(z) + (best - μ) · Φ(-z)
-    where μ = V̂^act - Ĉ^travel, z = (μ - best) / σ
+    R̂_{ik} = max_j Û_{ij} − Û_{ik}, with Û = V̂^act − Ĉ^travel, over the
+    alternatives in ``candidate_u_hats``: the candidates the RS may offer and,
+    optionally, the agent's organic alternative.
 
     Parameters
     ----------
-    v_hat_act : float
-        Estimated activity benefit.
-    c_hat_travel : float
-        Estimated travel cost.
-    sigma_i : float
-        User-specific uncertainty.
-    best_known_utility : float
-        Best alternative utility (0 = doing nothing).
+    u_hat : float
+        Estimated net utility of the candidate.
+    candidate_u_hats : Sequence[float]
+        Estimated net utilities of every alternative, this candidate included.
 
     Returns
     -------
     float
-        Expected regret, non-negative.
+        Regret, non-negative.
     """
-    mu = v_hat_act - c_hat_travel
-    if sigma_i <= 1e-8:
-        return max(0.0, best_known_utility - mu)
-
-    z = (mu - best_known_utility) / sigma_i
-    # φ(z) = standard normal pdf
-    phi_z = math.exp(-0.5 * z * z) / math.sqrt(2.0 * math.pi)
-    # Φ(-z)
-    cdf_neg_z = _normal_cdf(-z)
-    return sigma_i * phi_z + (best_known_utility - mu) * cdf_neg_z
+    return max(candidate_u_hats) - u_hat
 
 
-def estimate_activity_utility_from_score(
-    score: float,
-    leisure_subtype: str,
-    mode: str = DEFAULT_SCORE_TO_UTILITY_MODE,
-    score_scale: float = DEFAULT_SCORE_UTILITY_SCALE,
-) -> float:
-    """Map an RS score into the welfare layer's activity-utility scale.
+def estimate_activity_utility(rec: Recommendation, leisure_subtype: str) -> float:
+    """V̂^act: the agent's activity benefit, as the platform can estimate it.
 
-    Modes
-    -----
-    - ``identity``: legacy behavior, v_hat_act = score
-    - ``subtype_base_plus_score``: add the subtype's assumed base activity
-      utility to the RS score so the welfare layer operates on the same
-      utility scale used elsewhere in the ABM.
+    The agent is credited ``subtype base + motivation terms + taste bonus``
+    (Simulation.realised_activity_utility). The platform uses the same formula:
 
-    Set ``mode='identity'`` to revert to the previous behavior.
+    - the subtype's base benefit is a public parameter;
+    - the motivation terms are private to the agent and identical for every
+      venue of a subtype, so they are left out — they cancel in the regret,
+      and leave PUP's level slightly conservative;
+    - the taste bonus is ``match_bonus`` times the recommender's learned
+      personalization score P in [0, 1] (0.5 when it has learned nothing),
+      its only estimate of how well the venue fits the agent.
+
+    The ranking score is deliberately not used: rating and popularity are not
+    part of the agent's utility, and proximity already enters through Ĉ.
     """
-    bounded_score = max(0.0, float(score))
-    if mode == LEGACY_SCORE_TO_UTILITY_MODE:
-        return bounded_score
-    scaled_score = score_scale * bounded_score
-    if mode == DEFAULT_SCORE_TO_UTILITY_MODE:
-        base_utility = params.LEISURE_SEGMENTS.get(leisure_subtype, {}).get("activity_utility", 0.0)
-        return base_utility + scaled_score
-    raise ValueError(f"Unknown score-to-utility mode: {mode}")
+    base = params.LEISURE_SEGMENTS.get(leisure_subtype, {}).get("activity_utility", 0.0)
+    fit = rec.components.get("personalization", 0.5)
+    return base + params.TASTE_PARAMS["match_bonus"] * fit
 
 
 # ── Welfare-aware orchestrator ───────────────────────────────────────────────
@@ -299,18 +329,42 @@ class WelfareAnnotatedRecommendation:
     v_hat_act: float
     c_hat_travel: float
     pup: float
-    expected_regret: float
+    regret: float
     passed_pup: bool
     passed_rm: bool
+    #: The platform's estimate of the agent's organic alternative (see
+    #: WelfareAwareOrchestrator), or None when it has no candidates to average.
+    u_hat_organic: Optional[float] = None
 
 
 class WelfareAwareOrchestrator:
     """Wraps LeisureRSOrchestrator with PUP/RM gating.
 
+    The pool is the ``candidate_pool`` best-scored venues of the subtype (all
+    of them when None): the venues the platform is willing to offer. Each is
+    annotated with Û = V̂ − Ĉ, its PUP and its regret (Uğurel & Yabe 2026,
+    Eqs. 6 and 18)
+
+        R̂_k = max(Û_org, max_j Û_j) − Û_k,   j over the pool,
+
+    where Û_org is the agent's organic alternative as the platform estimates
+    it: Û averaged over every venue of the subtype, each weighted by how likely
+    the agent is to pick it unaided, ``exp(-d / organic_poi_proximity_scale_km)``
+    (the same proximity draw as Simulation.sample_poi). The gate drops the
+    candidates that fail it and returns the ``top_k_per_system`` best-scored
+    survivors, so the agent is offered the highest-scoring admissible venue
+    (Eqs. 9 and 10).
+
+    Û_org is an average of the same estimates, so it can only exceed the best
+    candidate when the pool leaves out venues the agent might pick itself. With
+    ``candidate_pool=None`` it never does, and RM never abstains.
+
     Treatment modes:
     - "standard": pass-through (no welfare filtering)
     - "pup": filter recommendations where PUP < α
-    - "rm": filter recommendations where E[R] > ε
+    - "rm": filter recommendations whose regret exceeds ε. At ε = 0 it offers
+      the candidate with the highest Û if that beats the organic alternative,
+      and abstains otherwise; as ε grows it becomes Standard.
     - "pup_rm": apply both constraints
     """
 
@@ -323,8 +377,8 @@ class WelfareAwareOrchestrator:
         rm_epsilon: float = params.WELFARE_GATE_DEFAULTS["rm_epsilon"],
         coord_scale_km: float = 1.0,
         coord_distance_km=haversine_km,
-        score_to_utility_mode: str = DEFAULT_SCORE_TO_UTILITY_MODE,
-        score_utility_scale: float = DEFAULT_SCORE_UTILITY_SCALE,
+        candidate_pool: Optional[int] = 20,
+        organic_reference: bool = True,
     ):
         self.base = base_orchestrator
         self.tce = travel_cost_estimator
@@ -334,8 +388,11 @@ class WelfareAwareOrchestrator:
         self.coord_scale_km = coord_scale_km
         # Straight-line (lat, lon) distance in km for the travel-cost estimate.
         self.coord_distance_km = coord_distance_km
-        self.score_to_utility_mode = score_to_utility_mode
-        self.score_utility_scale = score_utility_scale
+        # How many of the best-scored candidates the gate may offer, and so
+        # takes the best Û of. None = every candidate of the subtype.
+        self.candidate_pool = candidate_pool
+        # Whether the regret's benchmark includes the organic alternative.
+        self.organic_reference = organic_reference
         # Feedback history for continuous learning
         self.feedback_history: List[ContinuousFeedback] = []
 
@@ -347,33 +404,51 @@ class WelfareAwareOrchestrator:
     ) -> Dict[str, List[WelfareAnnotatedRecommendation]]:
         """Get welfare-annotated recommendations.
 
-        Returns recommendations from the base orchestrator, each annotated
-        with PUP and RM scores, and filtered according to the active mode.
+        Annotates the candidate pool from the base orchestrator with PUP and
+        regret, filters it according to the active mode, and returns the
+        ``top_k_per_system`` best-scored survivors per source.
         """
-        base_recs = self.base.recommend(user, leisure_subtype, top_k_per_system)
+        pool = max(self.candidate_pool or sys.maxsize, top_k_per_system)
+        # Every candidate, not just the pool: the organic alternative ranges
+        # over all of them.
+        base_recs = self.base.recommend(user, leisure_subtype, sys.maxsize)
         sigma_i = self.tce.get_user_uncertainty(user.user_id)
+        scale_km = params.CITY_PARAMS.get("organic_poi_proximity_scale_km", 3.0) or 1.0
 
         annotated: Dict[str, List[WelfareAnnotatedRecommendation]] = {}
         for source, recs in base_recs.items():
+            dists = [
+                self.coord_distance_km(user.location, rec.place.location) * self.coord_scale_km
+                for rec in recs
+            ]
+            v_hats = [estimate_activity_utility(rec, leisure_subtype) for rec in recs]
+            c_hats = self.tce.estimate_travel_costs(user.user_id, dists)
+            u_hats = [v - c for v, c in zip(v_hats, c_hats)]
+
+            u_hat_organic = None
+            if self.organic_reference:
+                weights = [math.exp(-d / scale_km) for d in dists]
+                total_weight = sum(weights)
+                if total_weight > 0:
+                    u_hat_organic = sum(w * u for w, u in zip(weights, u_hats)) / total_weight
+
+            # RM compares each offerable candidate with the best of the pool
+            # and the organic alternative.
+            u_hats = u_hats[:pool]
+            estimates = list(zip(recs, v_hats, c_hats))[:pool]
+            benchmark = list(u_hats)
+            if u_hat_organic is not None:
+                benchmark.append(u_hat_organic)
+            # The max is taken once here rather than inside compute_regret for
+            # every candidate, which is quadratic over a full pool.
+            best = (max(benchmark),)
             annotated_list = []
-            for rec in recs:
-                # Estimate V̂^act on the same scale as ABM activity utility.
-                v_hat_act = estimate_activity_utility_from_score(
-                    rec.score,
-                    leisure_subtype,
-                    mode=self.score_to_utility_mode,
-                    score_scale=self.score_utility_scale,
-                )
-
-                # Estimate Ĉ^travel
-                dist_km = self.coord_distance_km(user.location, rec.place.location) * self.coord_scale_km
-                c_hat_travel = self.tce.estimate_travel_cost(user.user_id, dist_km)
-
+            for (rec, v_hat_act, c_hat_travel), u_hat in zip(estimates, u_hats):
                 pup = compute_pup(v_hat_act, c_hat_travel, sigma_i)
-                e_regret = compute_expected_regret(v_hat_act, c_hat_travel, sigma_i)
+                regret = compute_regret(u_hat, best)
 
                 passed_pup = pup >= self.pup_alpha
-                passed_rm = e_regret <= self.rm_epsilon
+                passed_rm = regret <= self.rm_epsilon
 
                 annotated_list.append(
                     WelfareAnnotatedRecommendation(
@@ -381,9 +456,10 @@ class WelfareAwareOrchestrator:
                         v_hat_act=v_hat_act,
                         c_hat_travel=c_hat_travel,
                         pup=pup,
-                        expected_regret=e_regret,
+                        regret=regret,
                         passed_pup=passed_pup,
                         passed_rm=passed_rm,
+                        u_hat_organic=u_hat_organic,
                     )
                 )
 
@@ -396,16 +472,23 @@ class WelfareAwareOrchestrator:
                 annotated_list = [a for a in annotated_list if a.passed_pup and a.passed_rm]
             # "standard" → no filtering
 
-            annotated[source] = annotated_list
+            # The pool arrives sorted by score, and filtering keeps that order.
+            annotated[source] = annotated_list[: max(1, top_k_per_system)]
 
         return annotated
 
-    def record_continuous_feedback(self, feedback: ContinuousFeedback, travel_time_min: float, monetary_cost: float) -> None:
+    def record_continuous_feedback(
+        self,
+        feedback: ContinuousFeedback,
+        travel_time_min: float,
+        monetary_cost: float,
+        mode: Optional[str] = None,
+    ) -> None:
         """Record continuous feedback and update all learning components."""
         self.feedback_history.append(feedback)
 
         # Update travel cost estimator
-        self.tce.update(feedback, travel_time_min, monetary_cost)
+        self.tce.update(feedback, travel_time_min, monetary_cost, mode=mode)
 
     def record_feedback(self, user_id: int, source: str, place_id: str, liked: bool, feedback_strength: float = 1.0) -> None:
         """Backward-compatible binary feedback passthrough."""
