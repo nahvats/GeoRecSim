@@ -1,2 +1,2 @@
-All experiments finished 2026-10-20 01:46.
-760 runs: 8 cities x 5 seeds x 19 arms, 2000 agents, 30 days.
+All experiments finished 2026-10-20 09:00.
+800 runs: 8 cities x 5 seeds x 20 arms, 2000 agents, 30 days.

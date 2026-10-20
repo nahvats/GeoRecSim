@@ -40,6 +40,6 @@
     90,
     95
   ],
-  "oracle": false,
+  "oracle": true,
   "surprise_weight": 12.0
 }
