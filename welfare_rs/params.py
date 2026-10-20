@@ -723,10 +723,12 @@ FEEDBACK_PARAMS: dict = {
     # Like/dislike = sigmoid(sigmoid_scale * score), with score led by
     # surprise_weight * (the venue's activity benefit - the agent's usual for
     # that subtype); see Agent.evaluate_recommendation_feedback. Only the taste
-    # match (TASTE_PARAMS["match_bonus"], 0.15) varies by venue, so at 4.0 a
-    # match is liked about 18 points more often than a miss.
-    # Not estimated from data: the survey has no rating question.
-    "surprise_weight": 4.0,
+    # match (TASTE_PARAMS["match_bonus"], 0.15) varies by venue, so at 12 a
+    # match is liked about 47 points more often than a miss (measured on NYC:
+    # 18 points at 4, 34 at 8), with the overall like rate still about 50%.
+    # Not estimated from data: the survey has no rating question. 12 rather
+    # than 4 so that taste is discoverable within a study's run length.
+    "surprise_weight": 12.0,
     # Weight of the newest outing in the running average of the usual outing
     # (exponential smoothing), as for the agents' other reference points
     # (SIM_DEFAULTS["reference_point_smoothing"]).

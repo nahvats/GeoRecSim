@@ -10,7 +10,7 @@ export type RunStatus = "idle" | "running" | "ready" | "error";
 // 10,000, so an over-large population passed client validation and came back a
 // 422 the user had no way to anticipate.
 const MAX_AGENTS = 10000;
-const MAX_DAYS = 60;
+const MAX_DAYS = 400;
 const MAX_SEEDS = 12;
 
 interface ControlsProps {

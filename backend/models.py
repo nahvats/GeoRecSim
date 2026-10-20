@@ -95,7 +95,7 @@ class RunRequest(BaseModel):
     # like is enough to fill the top of the slate with matching venues.) 30 days
     # puts ~2.7 events on the average agent, which is where the curve starts to
     # move. Days are the cheap axis — the per-task routing precompute dominates.
-    num_days: int = Field(30, ge=1, le=60)
+    num_days: int = Field(30, ge=1, le=400)
     # None (the UI's default) means "draw a fresh base seed for this run".
     # A fixed seed did more than make runs repeatable: run_id() hashes the
     # config, so an identical request resolved to an identical id and the

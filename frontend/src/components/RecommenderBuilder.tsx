@@ -10,9 +10,9 @@ import { WEIGHT_KEYS } from "../types";
  * as the percentages they normalize to rather than as their raw values, because
  * the raw base weights are meaningless on their own — the engine renormalizes
  * them — and a slider that reads "0.35" next to three others is impossible to
- * reason about, while "34% of the ranking" is not. Personalization is the
- * exception: its slider is lambda of Eq. 11, the share of the score it gets,
- * and the base components share the rest.
+ * reason about, while "34% of the base" is not. The four base shares add up to
+ * 100% among themselves. Personalization is separate: its slider is lambda of
+ * Eq. 11, score = (1 − λ)·Base + λ·Personalization, and never rescales them.
  */
 
 const WEIGHT_LABELS: Record<WeightKey, { name: string; help: string }> = {
@@ -35,7 +35,7 @@ const WEIGHT_LABELS: Record<WeightKey, { name: string; help: string }> = {
 };
 
 const PERSONALIZATION_HELP =
-  "λ: the share of the score that is what the platform has learned this agent likes, from their past feedback. The only channel carrying anything agent-specific — and the only way it can ever discover an agent's latent taste. The base components above share the rest.";
+  "λ: the share of the score that is what the platform has learned this agent likes, from their past feedback. The only channel carrying anything agent-specific — and the only way it can ever discover an agent's latent taste. Score = (1 − λ)·Base + λ·Personalization; the base sliders above split Base among themselves.";
 
 const GATES: { value: string; label: string }[] = [
   { value: "", label: "None" },
@@ -67,14 +67,13 @@ export function personalizationShare(spec: RecommenderSpec): number {
   return Math.min(1, Math.max(0, spec.personalization_lambda));
 }
 
-/** Each base component's share of the whole score as the engine will compute
- * it — (1 − λ) times its share of the base — so the UI cannot disagree. */
+/** Each base component's share of the base score B, renormalized as the engine
+ * does — the four add up to 100% whatever lambda is. */
 export function normalizedWeights(spec: RecommenderSpec): Record<WeightKey, number> {
   const total = WEIGHT_KEYS.reduce((sum, k) => sum + Math.max(0, spec[k]), 0);
-  const rest = 1 - personalizationShare(spec);
   const out = {} as Record<WeightKey, number>;
   for (const k of WEIGHT_KEYS) {
-    out[k] = rest * (total > 0 ? Math.max(0, spec[k]) / total : 1 / WEIGHT_KEYS.length);
+    out[k] = total > 0 ? Math.max(0, spec[k]) / total : 1 / WEIGHT_KEYS.length;
   }
   return out;
 }
@@ -83,14 +82,12 @@ export function normalizedWeights(spec: RecommenderSpec): Record<WeightKey, numb
 export function specSummary(spec: RecommenderSpec): string {
   if (spec.random_ranking) return "uniform random · control";
   const w = normalizedWeights(spec);
-  const top = [
-    ...WEIGHT_KEYS.map((k) => ({ name: WEIGHT_LABELS[k].name, v: w[k] })),
-    { name: "Personalization", v: personalizationShare(spec) },
-  ]
+  const top = WEIGHT_KEYS.map((k) => ({ name: WEIGHT_LABELS[k].name, v: w[k] }))
     .sort((a, b) => b.v - a.v)
     .filter((x) => x.v > 0.01)
     .slice(0, 3)
     .map((x) => `${x.name} ${Math.round(x.v * 100)}%`);
+  top.push(`λ ${Math.round(personalizationShare(spec) * 100)}%`);
   const extra: string[] = [];
   if (spec.w_popularity > 0 && spec.popularity_gamma !== 1) {
     extra.push(`γ ${spec.popularity_gamma.toFixed(1)}`);
@@ -253,7 +250,7 @@ function SpecEditor({
         <>
           <h5>
             Ranking weights
-            <span className="muted small"> — shown as the share each gets</span>
+            <span className="muted small"> — share of the base score (adds up to 100%)</span>
           </h5>
           {WEIGHT_KEYS.map((key) => (
             <label className="rec-weight" key={key} title={WEIGHT_LABELS[key].help}>
