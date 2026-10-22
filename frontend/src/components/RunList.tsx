@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { listRuns, listStored } from "../api";
 import { condLabel } from "./charts";
 import { fmtDuration } from "./Controls";
+import { normalizedWeights } from "./RecommenderBuilder";
 import type { RunSummary, StoredStudy } from "../types";
 
 interface RunListProps {
@@ -130,12 +131,16 @@ function fmtDate(ts: number): string {
   });
 }
 
-/** The proximity weight(s) the study's built recommenders ran with, so studies
- *  made before and after a change to the Standard RS can be told apart. */
+/** Proximity's share of the base score in the study's built recommenders (as
+ *  the builder shows it), so studies made before and after a change to the
+ *  Standard RS can be told apart. */
 function proximityLabel(s: StoredStudy): string {
-  const values = [...new Set(s.recommenders.filter((r) => !r.oracle).map((r) => r.w_proximity))];
+  const shares = s.recommenders
+    .filter((r) => !r.oracle)
+    .map((r) => Math.round(normalizedWeights(r).w_proximity * 100));
+  const values = [...new Set(shares)];
   if (values.length === 0) return "";
-  return `proximity ${values.map((v) => v.toFixed(2)).join(" / ")}`;
+  return `proximity ${values.map((v) => `${v}%`).join(" / ")}`;
 }
 
 /**
