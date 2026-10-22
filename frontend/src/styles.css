@@ -95,6 +95,12 @@ body { background: var(--bg); color: var(--ink); }
 .run-badge-done { background: rgba(80, 170, 90, .16); color: #2f7a3c; }
 .run-badge-error { background: rgba(230, 80, 60, .16); color: #b03a28; }
 .run-badge-cancelled { background: #eef0f3; color: #777; }
+.run-tabs { margin-bottom: 8px; }
+.run-tabs .tab { flex: 1; }
+/* Storage tab: each saved study's Table 1 (mean net utility per arm). */
+.stored-t1 { width: 100%; margin-top: 4px; border-collapse: collapse; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.stored-t1 td { padding: 1px 0; }
+.stored-t1 td:last-child { text-align: right; }
 .run-track { display: block; margin-top: 5px; background: #eef0f3; border-radius: 4px; height: 4px; overflow: hidden; }
 .run-fill { display: block; height: 100%; background: var(--accent); transition: width .2s; }
 

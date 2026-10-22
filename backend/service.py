@@ -34,6 +34,7 @@ the **last (evaluation) day's** leisure trips per run, then aggregated across se
 
 from __future__ import annotations
 
+import calendar
 import functools
 import gzip
 import ctypes
@@ -60,7 +61,7 @@ import time
 import traceback
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from multiprocessing import connection as mp_connection
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -895,6 +896,9 @@ class Job:
     # therefore has no Run record yet), and so a browser that never saw the
     # submission can still show what it is.
     config: Optional["RunConfig"] = None
+    # True for a stored study being reopened from its checkpoints (Storage tab):
+    # nothing is simulated, so its timestamps say nothing about run time.
+    reopened: bool = False
     created_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
     # Cancellation: `cancel` is the in-process signal, checked by the study's own
@@ -924,6 +928,7 @@ class Job:
         with self._lock:
             return {
                 "status": self.status,
+                "reopened": self.reopened,
                 "created_at": self.created_at,
                 "finished_at": self.finished_at,
                 "error": self.error,
@@ -1292,6 +1297,112 @@ def _save_study_record(run_id: str, cfg: RunConfig, seeds: List[int],
     return path
 
 
+# ── Stored studies (the Storage tab) ─────────────────────────────────────────
+#
+# Studies are held in memory only while they are among the few most recently
+# used, and a service restart drops them all. On disk, though, every finished
+# study keeps its record (STUDY_RECORD_DIR) and every simulation's checkpoint
+# (TASK_RESULT_DIR/<run id>/). The Storage tab lists the records and reopens a
+# study from its checkpoints, exactly as it was: nothing is re-simulated, so a
+# study made with an older recommender setting stays what it was.
+
+#: Recommender fields of records saved before the convex fix. The
+#: personalization weight is now lambda (the same value); reviews and the
+#: learning rate no longer exist and are dropped.
+_LEGACY_SPEC_FIELDS = {"w_personalization": "personalization_lambda"}
+
+_stored_cache: Dict[str, Tuple[float, Optional[dict]]] = {}  # path -> (mtime, summary)
+_stored_lock = threading.Lock()
+
+
+def _spec_from_record(rec: dict) -> RecommenderSpec:
+    known = {f.name for f in fields(RecommenderSpec)}
+    spec = {}
+    for key, value in rec.items():
+        key = _LEGACY_SPEC_FIELDS.get(key, key)
+        if key in known:
+            spec[key] = value
+    return RecommenderSpec(**spec)
+
+
+def _read_study_record(path: str) -> dict:
+    """Summarise one study record for the Storage tab.
+
+    Keys starting with ``_`` are for reopening and are not sent to the browser.
+    """
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        record = json.load(fh)
+    raw = record["config"]
+    run_id = record["run_id"]
+    seeds = [int(s) for s in record["seeds"]]
+    conditions = list(record["conditions"])
+    run_fields = {f.name for f in fields(RunConfig)}
+    config = RunConfig(
+        **{k: v for k, v in raw.items() if k in run_fields and k != "recommenders"},
+        recommenders=tuple(_spec_from_record(r) for r in raw.get("recommenders", [])),
+    )
+
+    reason = None
+    if config.all_conditions() != conditions:
+        reason = "saved before the Oracle control existed"
+    else:
+        missing = [
+            (s, c) for s in seeds for c in conditions
+            if not all(os.path.exists(_task_checkpoint(run_id, s, c) + ext)
+                       for ext in (".pkl", ".viz.pkl"))
+        ]
+        if missing:
+            reason = f"{len(missing)} of {len(seeds) * len(conditions)} simulation checkpoints are missing"
+    saved = record.get("saved_at")
+    return {
+        "run_id": run_id,
+        "city": config.city,
+        "city_label": _CITY_LABELS.get(config.city, config.city),
+        "saved_at": (calendar.timegm(time.strptime(saved, "%Y-%m-%dT%H:%M:%SZ"))
+                     if saved else os.path.getmtime(path)),
+        "num_agents": config.num_agents,
+        "num_days": config.num_days,
+        "num_seeds": len(seeds),
+        "conditions": conditions,
+        # Each built arm's settings as it ran, so studies made with different
+        # recommender settings can be told apart.
+        "recommenders": [asdict(spec) for spec in config.recommenders],
+        "table1": [
+            {k: row.get(k) for k in ("condition", "mean_utility", "sigma_u", "abstention_rate")}
+            for row in record.get("table1", [])
+        ],
+        "reopenable": reason is None,
+        "reason": reason,
+        "_config": config,
+        "_seeds": seeds,
+    }
+
+
+def stored_studies() -> List[dict]:
+    """Every study record on disk, newest first. Records are parsed once and
+    re-read only when the file changes."""
+    if not os.path.isdir(STUDY_RECORD_DIR):
+        return []
+    paths = sorted(os.path.join(STUDY_RECORD_DIR, n) for n in os.listdir(STUDY_RECORD_DIR)
+                   if n.endswith(".json.gz"))
+    out = []
+    with _stored_lock:
+        for path in paths:
+            mtime = os.path.getmtime(path)
+            cached = _stored_cache.get(path)
+            if cached is None or cached[0] != mtime:
+                try:
+                    summary = _read_study_record(path)
+                except Exception as exc:  # one unreadable record must not hide the rest
+                    print(f"stored study {path}: unreadable ({exc!r})", flush=True)
+                    summary = None
+                _stored_cache[path] = cached = (mtime, summary)
+            if cached[1] is not None:
+                out.append(cached[1])
+    out.sort(key=lambda s: s["saved_at"], reverse=True)
+    return out
+
+
 # ── Aggregation across seeds ─────────────────────────────────────────────────
 
 def _agg_table1_row(condition: str, per_seed_rows: List[dict]) -> dict:
@@ -1457,6 +1568,9 @@ class RunManager:
         # a single shared process pool evenly between whoever is running.
         self._executor = ThreadPoolExecutor(max_workers=MAX_STUDIES,
                                             thread_name_prefix="study")
+        # Reopening a stored study only reads checkpoints, so it must not queue
+        # behind studies that are simulating.
+        self._reopen_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="reopen")
         self._runs: Dict[str, Run] = {}
         self._jobs: Dict[str, Job] = {}
         self._access: Dict[str, float] = {}   # run_id -> last read, for LRU eviction
@@ -1530,6 +1644,38 @@ class RunManager:
             return True
         return False
 
+    def list_stored(self) -> List[dict]:
+        """Every study saved on disk, for the Storage tab; ``open`` says whether
+        it is currently loaded."""
+        with self._lock:
+            resident = set(self._runs)
+        return [
+            {**{k: v for k, v in s.items() if not k.startswith("_")},
+             "open": s["run_id"] in resident}
+            for s in stored_studies()
+        ]
+
+    def open_stored(self, run_id: str) -> tuple[str, str]:
+        """Load a stored study from its checkpoints. Returns ``(run_id, status)``
+        like ``submit``. Raises KeyError for an unknown id and ValueError for a
+        study that cannot be reopened."""
+        stored = next((s for s in stored_studies() if s["run_id"] == run_id), None)
+        if stored is None:
+            raise KeyError(run_id)
+        if not stored["reopenable"]:
+            raise ValueError(stored["reason"])
+        config, seeds = stored["_config"], stored["_seeds"]
+        with self._lock:
+            if run_id in self._runs:
+                return run_id, "ready"
+            job = self._jobs.get(run_id)
+            if job is not None and job.status == "running":
+                return run_id, "running"
+            job = Job(run_id=run_id, total=len(seeds), config=config, reopened=True)
+            self._jobs[run_id] = job
+        self._reopen_executor.submit(self._execute, run_id, config, seeds)
+        return run_id, "running"
+
     def submit(self, config: RunConfig) -> tuple[str, str]:
         """Return ``(run_id, status)``. status: ready | running."""
         run_id = config.run_id()
@@ -1546,12 +1692,14 @@ class RunManager:
         self._executor.submit(self._execute, run_id, config)
         return run_id, "running"
 
-    def _execute(self, run_id: str, config: RunConfig) -> None:
+    def _execute(self, run_id: str, config: RunConfig,
+                 reopen_seeds: Optional[List[int]] = None) -> None:
         job = self._jobs[run_id]
         try:
-            run = self._build_study(run_id, config, job)
+            run = self._build_study(run_id, config, job, reopen_seeds)
             run.created_at = job.created_at
-            run.duration_sec = time.time() - job.created_at
+            # A reopened study was only read from disk; its run time is unknown.
+            run.duration_sec = None if job.reopened else time.time() - job.created_at
             with self._lock:
                 self._runs[run_id] = run
                 self._access[run_id] = time.time()
@@ -1575,8 +1723,11 @@ class RunManager:
         finally:
             GOVERNOR.unregister(run_id)
 
-    def _build_study(self, run_id: str, cfg: RunConfig, job: Job) -> Run:
-        seeds = cfg.seeds()
+    def _build_study(self, run_id: str, cfg: RunConfig, job: Job,
+                     reopen_seeds: Optional[List[int]] = None) -> Run:
+        """Run a study, reusing any finished checkpoints. With ``reopen_seeds``
+        it only reloads a stored study: those seeds, from checkpoints alone."""
+        seeds = cfg.seeds() if reopen_seeds is None else reopen_seeds
         conditions = cfg.all_conditions()
         # One task = one simulation = one (seed, condition) pair, No RS included.
         # Oracle tasks first: they are the slowest, so they set the study's length.
@@ -1602,6 +1753,9 @@ class RunManager:
                 job.current += num_days
                 job.per_condition[t[1]] += num_days
         tasks = [t for t in tasks if t not in results]
+        if tasks and reopen_seeds is not None:
+            raise RuntimeError(f"{len(tasks)} simulation checkpoints are missing; "
+                               "a stored study is reopened, never re-simulated")
 
         # Ticks arrive from every worker at once, so the counter needs a lock.
         # Publishing happens outside it to keep the SSE fan-out off the critical
@@ -1625,7 +1779,8 @@ class RunManager:
 
         if tasks:
             self._run_tasks(run_id, cfg_dict, tasks, checkpoint, results, job, _tick)
-        return self._assemble(run_id, cfg, seeds, results)
+        return self._assemble(run_id, cfg, seeds, results,
+                              save_record=reopen_seeds is None)
 
     @staticmethod
     def _run_tasks(run_id: str, cfg_dict: dict, tasks: List[Tuple[int, str]],
@@ -1783,7 +1938,7 @@ class RunManager:
         return rows
 
     def _assemble(self, run_id: str, cfg: RunConfig, seeds: List[int],
-                  results: Dict[Tuple[int, str], dict]) -> Run:
+                  results: Dict[Tuple[int, str], dict], save_record: bool = True) -> Run:
         conditions = cfg.all_conditions()
         # Only seeds that produced *every* condition are usable: a seed missing
         # its No-RS run has nothing to pair against, and one missing a
@@ -1811,11 +1966,14 @@ class RunManager:
             for c in conditions if c != CONTROL
         ]
 
-        try:
-            path = _save_study_record(run_id, cfg, ok_seeds, results, table1, table2)
-            print(f"study {run_id}: record saved to {path}", flush=True)
-        except Exception as exc:  # the study itself is still good; say so loudly
-            print(f"study {run_id}: FAILED to save study record: {exc!r}", flush=True)
+        # A reopened study already has its record; rewriting it would only
+        # change its saved date.
+        if save_record:
+            try:
+                path = _save_study_record(run_id, cfg, ok_seeds, results, table1, table2)
+                print(f"study {run_id}: record saved to {path}", flush=True)
+            except Exception as exc:  # the study itself is still good; say so loudly
+                print(f"study {run_id}: FAILED to save study record: {exc!r}", flush=True)
 
         t1_by_cond = {r["condition"]: r for r in table1}
         t2_by_cond = {r["condition"]: r for r in table2}

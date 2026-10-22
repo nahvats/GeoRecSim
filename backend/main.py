@@ -11,6 +11,8 @@ Endpoints (all under ``/api``) let the browser stream only what it needs:
 * ``GET  /api/runs/{id}/positions?condition&seed&t&bbox``    — exact-instant positions
 * ``GET  /api/runs/{id}/trips/{trip_id}/geometry?condition&seed`` — full route
 * ``GET  /api/runs/{id}/pois?seed&bbox``            — viewport POIs
+* ``GET  /api/stored``                         — studies saved on disk (Storage tab)
+* ``POST /api/stored/{id}/open``               — reopen one from its checkpoints
 
 A "run" is a *study*: several recommender conditions (always including the No-RS
 control) swept across several seeds. The geometry endpoints take an optional
@@ -30,6 +32,7 @@ import json
 import os
 import queue
 import sys
+import threading
 from typing import Optional
 
 # Make the engine importable even without `pip install -e .` (repo root on path).
@@ -45,7 +48,7 @@ import viz
 from models import RunRequest
 from service import (CITIES, CONTROL, ORACLE, GOVERNOR, MAX_RECOMMENDERS, MAX_STUDIES,
                      TREATMENTS, RunConfig,
-                     manager, precomputed_cities, warmed_cities)
+                     manager, precomputed_cities, stored_studies, warmed_cities)
 from welfare_rs.recommender_systems import RECOMMENDER_PRESETS
 
 # Interactive docs are opt-in. The OpenAPI schema is a machine-readable manual
@@ -237,6 +240,33 @@ def run_events(run_id: str) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# ── Stored studies (Storage tab) ──────────────────────────────────────────────
+
+# Parsing every record takes several seconds the first time, so do it in the
+# background at startup rather than in the first visitor's Storage tab.
+threading.Thread(target=stored_studies, name="stored-index", daemon=True).start()
+
+
+@app.get("/api/stored")
+def list_stored() -> dict:
+    """Every study saved on disk, including ones no longer held in memory
+    (evicted, or from before a restart)."""
+    return {"studies": manager.list_stored()}
+
+
+@app.post("/api/stored/{run_id}/open")
+def open_stored(run_id: str) -> dict:
+    """Load a stored study from its checkpoints (no simulation), after which
+    it opens like any other run."""
+    try:
+        run_id, status = manager.open_stored(run_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="no stored study with this id")
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=f"this study can't be reopened: {exc}")
+    return {"run_id": run_id, "status": status}
 
 
 # ── Geometry / positions (the streamed, viewport-culled payloads) ─────────────

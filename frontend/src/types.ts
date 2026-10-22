@@ -199,6 +199,28 @@ export interface RunSummary {
   finished_at: number | null;
   error: string | null;
   progress: RunProgress;
+  /** True when the study was reopened from storage rather than simulated. */
+  reopened?: boolean;
+}
+
+/** One row of GET /api/stored: a study saved on disk (the Storage tab). */
+export interface StoredStudy {
+  run_id: string;
+  city: string;
+  city_label: string;
+  saved_at: number; // epoch seconds
+  num_agents: number;
+  num_days: number;
+  num_seeds: number;
+  conditions: string[];
+  /** Each built arm's settings as it ran. */
+  recommenders: (RecommenderSpec & { oracle?: boolean })[];
+  table1: { condition: string; mean_utility: number; sigma_u: number; abstention_rate: number | null }[];
+  /** False when its checkpoints are incomplete; `reason` says why. */
+  reopenable: boolean;
+  reason: string | null;
+  /** Currently loaded on the server. */
+  open: boolean;
 }
 
 export interface CreateRunResponse {

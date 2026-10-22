@@ -5,7 +5,7 @@ import Results from "./components/Results";
 import RunList from "./components/RunList";
 import { BLANK_SPEC } from "./components/RecommenderBuilder";
 import { condLabel } from "./components/charts";
-import { cancelRun, createRun, fetchRun, getCities, getRun, subscribeProgress } from "./api";
+import { cancelRun, createRun, fetchRun, getCities, getRun, openStored, subscribeProgress } from "./api";
 import type { CitiesResponse, RunConfig, RunMeta, RunProgress } from "./types";
 
 /** Read/write the ?run=<id> query param, so a run survives reload and can be
@@ -161,10 +161,20 @@ export default function App() {
   // Open a run this tab may not have started: a ?run= link, a reload, or a pick
   // from the run list.
   const attachTo = useCallback(
-    async (runId: string) => {
+    async (runId: string, fromStorage = true) => {
       setError(null);
       try {
-        const found = await fetchRun(runId);
+        let found = await fetchRun(runId);
+        // Not in memory (evicted, or the server restarted since): if it is saved
+        // on disk, reload it from there, so old ?run= links keep working.
+        if (found.state === "gone" && fromStorage) {
+          try {
+            await openStored(runId);
+            found = await fetchRun(runId);
+          } catch {
+            /* not stored, or not reopenable — report the original reason */
+          }
+        }
         if (found.state === "ready") {
           stopWatching(); // leaving a run that was still streaming
           adoptRun(found.meta);
@@ -186,6 +196,22 @@ export default function App() {
       bumpRuns();
     },
     [adoptRun, watchRun, stopWatching]
+  );
+
+  // Open a study from the Storage tab: the server reloads it from its
+  // checkpoints (a few seconds; nothing is simulated), then it opens like any run.
+  const openFromStorage = useCallback(
+    async (runId: string) => {
+      setError(null);
+      try {
+        await openStored(runId);
+      } catch (e: any) {
+        setError(e.message ?? String(e));
+        return;
+      }
+      await attachTo(runId, false);
+    },
+    [attachTo]
   );
 
   // On first load, open whatever run the URL names.
@@ -251,6 +277,7 @@ export default function App() {
         <RunList
           activeRunId={runMeta?.run_id ?? runningIdRef.current}
           onOpen={(id) => void attachTo(id)}
+          onOpenStored={(id) => void openFromStorage(id)}
           refreshToken={runsToken}
         />
       </Controls>

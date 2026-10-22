@@ -599,9 +599,13 @@ RECOMMENDER_PRESETS: Dict[str, Dict[str, float]] = {
         "w_proximity": 0.25, "w_popularity": 0.18, "personalization_lambda": 0.15,
         "distance_scale_km": 5.0, "popularity_gamma": 1.0,
     },
+    # Proximity lowered 0.20 -> 0.10 on 2026-10-22: net utility is mostly travel
+    # cost, so at 0.20 the ungated ranking was already close to welfare-optimal
+    # and the gates had little to improve on. Studies run at 0.20 stay in the
+    # website's Storage tab for sensitivity analysis.
     "Personalized": {
         "w_rating": 0.15, "w_relevance": 0.10,
-        "w_proximity": 0.20, "w_popularity": 0.10, "personalization_lambda": 0.35,
+        "w_proximity": 0.10, "w_popularity": 0.10, "personalization_lambda": 0.35,
         "distance_scale_km": 5.0, "popularity_gamma": 1.0,
     },
     "Viral": {

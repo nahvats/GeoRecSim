@@ -10,6 +10,7 @@ import type {
   RunConfig,
   RunMeta,
   RunSummary,
+  StoredStudy,
   TimelineResponse,
   TripGeometry,
 } from "./types";
@@ -48,6 +49,28 @@ export function getRun(runId: string): Promise<RunMeta> {
 export async function listRuns(): Promise<RunSummary[]> {
   const data = await getJSON<{ runs: RunSummary[] }>(`${API}/runs`);
   return data.runs;
+}
+
+/** Studies saved on disk, newest first (the Storage tab). */
+export async function listStored(): Promise<StoredStudy[]> {
+  const data = await getJSON<{ studies: StoredStudy[] }>(`${API}/stored`);
+  return data.studies;
+}
+
+/** Reload a stored study from its checkpoints; nothing is re-simulated. */
+export async function openStored(runId: string): Promise<{ run_id: string; status: "ready" | "running" }> {
+  const res = await fetch(`${API}/stored/${runId}/open`, { method: "POST" });
+  if (!res.ok) {
+    let reason = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) reason = String(body.detail);
+    } catch {
+      /* non-JSON error body — keep the status line */
+    }
+    throw new Error(reason);
+  }
+  return res.json();
 }
 
 export type RunLookup =
