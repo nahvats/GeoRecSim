@@ -1,0 +1,54 @@
+{
+  "cities": [
+    "houston",
+    "la",
+    "chicago",
+    "sf_bay",
+    "nyc",
+    "dc",
+    "seattle",
+    "miami"
+  ],
+  "n_agents": 2000,
+  "n_days": 30,
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "recommender": "Personalized",
+  "recommender_config": {
+    "w_rating": 0.15,
+    "w_relevance": 0.1,
+    "w_proximity": 0.1,
+    "w_popularity": 0.1,
+    "personalization_lambda": 0.35,
+    "distance_scale_km": 5.0,
+    "popularity_gamma": 1.0
+  },
+  "pup_alphas": [
+    0.1,
+    0.2,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8,
+    0.9,
+    1.0
+  ],
+  "rm_percentiles": [
+    0,
+    60,
+    70,
+    75,
+    80,
+    90,
+    95
+  ],
+  "oracle": true,
+  "surprise_weight": 12.0
+}
