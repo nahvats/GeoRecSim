@@ -1,8 +1,8 @@
 """Submit the main welfare-gating study to the live website, one study per metro.
 
-Each study: Personalized (the study's Standard RS) ungated, with PUP and with RM at the default thresholds
-(welfare_rs.params.WELFARE_GATE_DEFAULTS), plus the No RS and Oracle controls the
-website always adds. 2,500 agents, 60 days, 5 seeds (42-46).
+Each study: Personalized (the study's Standard RS) ungated, with PUP, with RM and with PUP+RM at the
+default thresholds (welfare_rs.params.WELFARE_GATE_DEFAULTS), plus the No RS and Oracle controls the
+website always adds. 2,000 agents, 100 days, 5 seeds (42-46).
 
 The studies show on the website (Table 1, Table 2 / ORC) as they finish, and each
 finished study is also saved to .cache/studies/<city>_<run_id>.json.gz with the
@@ -33,8 +33,10 @@ RECOMMENDERS = [
     BASE,
     {**BASE, "label": "Personalized + PUP", "welfare_gate": "pup", "pup_alpha": GATES["pup_alpha"]},
     {**BASE, "label": "Personalized + RM", "welfare_gate": "rm", "rm_epsilon": GATES["rm_epsilon"]},
+    {**BASE, "label": "Personalized + PUP+RM", "welfare_gate": "pup_rm",
+     "pup_alpha": GATES["pup_alpha"], "rm_epsilon": GATES["rm_epsilon"]},
 ]
-STUDY = {"num_agents": 2500, "num_days": 60, "seed": 42, "num_seeds": 5,
+STUDY = {"num_agents": 2000, "num_days": 100, "seed": 42, "num_seeds": 5,
          "use_real_pois": True, "recommenders": RECOMMENDERS}
 MANIFEST = REPO / ".cache" / "studies" / "main_study.json"
 
