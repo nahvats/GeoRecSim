@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from . import params
+from .experiment_harness import leisure_net_utility
 from .recommender_systems import (
     LeisureRSOrchestrator,
     Recommendation,
@@ -40,6 +41,9 @@ class ContinuousFeedback:
         activity_utility: Realized activity utility.
         travel_utility: Realized travel utility (negative = costly).
         net_utility: satisfaction proxy = activity_utility + travel_utility.
+        realized_utility: the trip's net utility U = V - C/xi, as the welfare
+            metric scores it (leisure_net_utility); the record carries the
+            realized activity utility and generalized cost it is made of.
     """
 
     user_id: int
@@ -50,6 +54,7 @@ class ContinuousFeedback:
     activity_utility: float
     travel_utility: float
     net_utility: float
+    realized_utility: float
 
 
 def compute_continuous_feedback(
@@ -96,6 +101,7 @@ def compute_continuous_feedback(
         activity_utility=trip.activity_utility,
         travel_utility=trip.travel_utility,
         net_utility=net_utility,
+        realized_utility=leisure_net_utility(trip),
     )
 
 
@@ -124,6 +130,9 @@ class TravelCostEstimator:
 
     Value of time is updated from continuous feedback: dissatisfaction with a
     long trip raises it 5%, satisfaction with one lowers it 3% (paper B.3).
+
+    The uncertainty σ_i of PUP is learned from the platform's prediction errors
+    (paper Eq. 17): see :meth:`get_user_uncertainty`.
     """
 
     def __init__(
@@ -132,14 +141,25 @@ class TravelCostEstimator:
         learning_rate: float = 0.15,
         metro: Optional[str] = None,
         default_mode: str = "car",
+        sigma_prior: float = params.WELFARE_GATE_DEFAULTS["pup_sigma_prior"],
+        sigma_prior_strength: float = params.WELFARE_GATE_DEFAULTS["pup_sigma_prior_strength"],
     ):
         self.default_vot = default_vot
         self.learning_rate = learning_rate
         self.metro = metro
         self.default_mode = default_mode
+        self.sigma_prior = sigma_prior
+        self.sigma_prior_strength = sigma_prior_strength
         # Per-user state: {user_id: {"vot": float, "avg_travel_cost": float,
-        # "n": int, "modes": Counter}}
+        # "n": int, "modes": Counter, "sq_err": float, "n_err": int}}
         self.user_estimates: Dict[int, Dict[str, float]] = {}
+
+    def _state(self, user_id: int) -> Dict[str, float]:
+        return self.user_estimates.setdefault(
+            user_id,
+            {"vot": self.default_vot, "avg_travel_cost": 0.0, "n": 0, "modes": Counter(),
+             "sq_err": 0.0, "n_err": 0},
+        )
 
     def update(
         self,
@@ -152,10 +172,7 @@ class TravelCostEstimator:
 
         ``mode`` is how the user travelled to the venue, which a platform that
         sent them there observes."""
-        state = self.user_estimates.setdefault(
-            feedback.user_id,
-            {"vot": self.default_vot, "avg_travel_cost": 0.0, "n": 0, "modes": Counter()},
-        )
+        state = self._state(feedback.user_id)
         state["n"] += 1
         if mode:
             state["modes"][mode] += 1
@@ -227,16 +244,34 @@ class TravelCostEstimator:
         state = self.user_estimates.get(user_id)
         return state["vot"] if state else self.default_vot
 
-    def get_user_uncertainty(self, user_id: int) -> float:
-        """Return uncertainty (σ) for user's utility estimate.
+    def record_prediction_error(self, user_id: int, error: float) -> None:
+        """Record one prediction error ``U - Û`` of this user's: the realized
+        net utility of a recommendation they took minus the platform's estimate
+        of it when it was offered."""
+        state = self._state(user_id)
+        state["sq_err"] += error * error
+        state["n_err"] += 1
 
-        Decreases with more observations. Used in PUP computation.
+    def get_user_uncertainty(self, user_id: int) -> float:
+        """σ_i of PUP (paper Eq. 17): the residual uncertainty of ``Û``,
+        "learned from prediction errors in the feedback history".
+
+            σ_i² = (κ · σ_0² + Σ_j e_j²) / (κ + n_i)
+
+        the user's mean squared error ``e = U - Û`` over the n_i
+        recommendations they took, shrunk toward the prior σ_0 with the weight
+        of κ pseudo-observations. A user with no feedback gets σ_0, which is
+        calibrated as the root mean squared error of Û over the Standard RS's
+        accepted recommendations, the way RM's ε is calibrated from Standard's
+        regrets. So σ_i is in the units of U and never rests on an arbitrary
+        cold-start value: the previous 1/√n with a cold start of 1 was four
+        times the measured error, and with no feedback it never moved, so a
+        strict α abstained forever.
         """
         state = self.user_estimates.get(user_id)
-        if state is None or state["n"] == 0:
-            return 1.0  # high uncertainty
-        # Uncertainty decays as 1/sqrt(n), floored at 0.15
-        return max(0.15, 1.0 / math.sqrt(state["n"]))
+        sq_err, n_err = (0.0, 0) if state is None else (state["sq_err"], state["n_err"])
+        k = self.sigma_prior_strength
+        return math.sqrt((k * self.sigma_prior ** 2 + sq_err) / (k + n_err))
 
 
 # ── PUP and RM computation ───────────────────────────────────────────────────
@@ -397,6 +432,9 @@ class WelfareAwareOrchestrator:
         self.organic_reference = organic_reference
         # Feedback history for continuous learning
         self.feedback_history: List[ContinuousFeedback] = []
+        # user_id -> {place_id: Û} of the venues last offered to the user, so
+        # the feedback on the one taken can be scored against its estimate.
+        self._offered_u_hat: Dict[int, Dict[str, float]] = {}
 
     def recommend(
         self,
@@ -477,6 +515,10 @@ class WelfareAwareOrchestrator:
             # The pool arrives sorted by score, and filtering keeps that order.
             annotated[source] = annotated_list[: max(1, top_k_per_system)]
 
+        self._offered_u_hat[user.user_id] = {
+            a.recommendation.place.place_id: a.v_hat_act - a.c_hat_travel
+            for recs in annotated.values() for a in recs
+        }
         return annotated
 
     def record_continuous_feedback(
@@ -491,6 +533,10 @@ class WelfareAwareOrchestrator:
 
         # Update travel cost estimator
         self.tce.update(feedback, travel_time_min, monetary_cost, mode=mode)
+        # Score the estimate the venue was offered with against the outcome.
+        u_hat = self._offered_u_hat.get(feedback.user_id, {}).get(feedback.place_id)
+        if u_hat is not None:
+            self.tce.record_prediction_error(feedback.user_id, feedback.realized_utility - u_hat)
 
     def record_feedback(self, user_id: int, source: str, place_id: str, liked: bool, feedback_strength: float = 1.0) -> None:
         """Backward-compatible binary feedback passthrough."""

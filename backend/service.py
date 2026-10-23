@@ -70,6 +70,7 @@ from welfare_rs import metrics as sim_metrics
 from welfare_rs import params, routing_matrix
 from welfare_rs.datasource import get_datasource
 from welfare_rs.experiment_harness import (
+    eval_day_accepted_ids,
     eval_day_leisure_utilities,
     leisure_net_utility,
     table1_metrics,
@@ -761,6 +762,12 @@ class RunConfig:
             # A study cached before the Oracle control existed has no Oracle
             # arm, so it must not be handed back for the same settings.
             "oracle_control",
+            # Common random numbers and the learned PUP sigma (2026-10-22)
+            # changed every arm's results, so no earlier checkpoint is reused.
+            "crn_sigma_2026-10-22",
+            # PUP's sigma prior is a gate parameter that the specs do not carry.
+            round(params.WELFARE_GATE_DEFAULTS["pup_sigma_prior"], 4),
+            round(params.WELFARE_GATE_DEFAULTS["pup_sigma_prior_strength"], 4),
         )
         return hashlib.sha1(repr(key).encode()).hexdigest()[:16]
 
@@ -1202,6 +1209,8 @@ def _simulate(cfg: dict, seed: int, condition: str, cancel_event=None,
         "condition": condition,
         "t1": table1_metrics(sim),
         "utils": eval_day_leisure_utilities(sim.agents),
+        # Table 2's agent-trip pairs: who went to an accepted recommendation.
+        "accepted": eval_day_accepted_ids(sim.agents),
         "metrics": run_metrics.finalize(sim),
         "summary": {
             "recommendation_acceptance_rate": summ.get("recommendation_acceptance_rate", 0.0),
@@ -1271,7 +1280,8 @@ def _save_study_record(run_id: str, cfg: RunConfig, seeds: List[int],
                 "condition": condition,
                 "table1": res["t1"],
                 "table2": (None if condition == CONTROL
-                           else table2_from_utilities(res["utils"], control_utils)),
+                           else table2_from_utilities(res["utils"], control_utils,
+                                                      accepted=res.get("accepted"))),
                 "summary": res["summary"],
                 "eval_trips": res["eval_trips"],
                 "eval_utility": res["utils"],
@@ -1420,11 +1430,14 @@ def _agg_table1_row(condition: str, per_seed_rows: List[dict]) -> dict:
 
 
 def _agg_table2(condition: str, per_seed_t2: List[dict]) -> dict:
+    # A seed with no harmed pair has no ORC (None), so it is left out of the
+    # mean rather than counted as zero loss.
+    orcs = [t["mean_orc"] for t in per_seed_t2 if t["mean_orc"] is not None]
     return {
         "condition": condition,
         "harmed_pct": float(np.mean([t["harmed_pct"] for t in per_seed_t2])),
         "improved_pct": float(np.mean([t["improved_pct"] for t in per_seed_t2])),
-        "mean_orc": float(np.mean([t["mean_orc"] for t in per_seed_t2])),
+        "mean_orc": float(np.mean(orcs)) if orcs else None,
         "n_matched": int(np.sum([t["n_matched"] for t in per_seed_t2])),
     }
 
@@ -1960,7 +1973,8 @@ class RunManager:
         table2 = [
             _agg_table2(c, [
                 table2_from_utilities(results[(s, c)]["utils"],
-                                      results[(s, CONTROL)]["utils"])
+                                      results[(s, CONTROL)]["utils"],
+                                      accepted=results[(s, c)].get("accepted"))
                 for s in ok_seeds
             ])
             for c in conditions if c != CONTROL

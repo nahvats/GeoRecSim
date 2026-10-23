@@ -154,6 +154,15 @@ def eval_day_leisure_utilities(agents) -> Dict[int, float]:
     return out
 
 
+def eval_day_accepted_ids(agents) -> List[int]:
+    """Ids of the agents whose eval-day leisure trip went to a recommendation
+    they accepted: the agent-trip pairs of the paper's Table 2 (Eq. 14)."""
+    return sorted(
+        a.id for a in agents
+        if any(t.purpose == "leisure" and t.accepted_recommendation for t in a.trips)
+    )
+
+
 def table1_metrics(sim) -> Dict[str, float]:
     """Paper Table 1 metrics for a single run, over the eval-day leisure trips.
 
@@ -183,44 +192,59 @@ def table1_metrics(sim) -> Dict[str, float]:
 
 
 def table2_from_utilities(
-    u_rec: Dict[int, float], u_org: Dict[int, float]
-) -> Dict[str, float]:
+    u_rec: Dict[int, float],
+    u_org: Dict[int, float],
+    accepted: Optional[Sequence[int]] = None,
+) -> Dict[str, Optional[float]]:
     """Paper Table 2 from two ``agent_id -> eval-day leisure utility`` maps.
 
+    The agent-trip pairs are the eval-day trips to an accepted recommendation
+    (``accepted``, from :func:`eval_day_accepted_ids`) whose agent also took a
+    leisure trip in the matched No-RS run (Uğurel & Yabe 2026, §5.3: "for each
+    accepted recommendation ... whether the agent would have been better off
+    under the No RS counterfactual"). Over those pairs:
+
+    - Harmed % / Improved %: the share whose utility under the treatment is
+      lower / higher than in the No-RS run (ties are neither);
+    - Mean ORC (Eq. 14): the mean of ``U_organic - U_rec`` over the harmed
+      pairs, None when no pair is harmed (an average over nothing).
+
+    ``accepted=None`` pairs every agent with a leisure trip in both runs, the
+    definition used before 2026-10-22, kept for studies that did not record
+    acceptance.
+
     Split out of :func:`table2_metrics` so the paired comparison can be made
-    from *serialized* per-agent utilities instead of two live Simulation
-    objects. That is what lets a treatment and its matched No-RS baseline run in
-    separate processes: each worker returns only its own utility map (a few MB
-    even at 100k agents) and the parent does the pairing afterwards.
+    from *serialized* per-agent data instead of two live Simulation objects:
+    each worker returns only its own maps and the parent does the pairing.
+    The pairing is meaningful because arms share common random numbers
+    (Simulation._agent_stream).
     """
-    common = sorted(set(u_rec) & set(u_org))
+    pool = set(u_rec) & set(u_org)
+    if accepted is not None:
+        pool &= set(accepted)
+    common = sorted(pool)
     n = len(common)
     if n == 0:
-        return {"harmed_pct": 0.0, "improved_pct": 0.0, "mean_orc": 0.0, "n_matched": 0}
+        return {"harmed_pct": 0.0, "improved_pct": 0.0, "mean_orc": None, "n_matched": 0}
     diffs = [u_rec[i] - u_org[i] for i in common]  # rec - organic
     harmed = [d for d in diffs if d < 0]
     improved = [d for d in diffs if d > 0]
     return {
         "harmed_pct": len(harmed) / n,
         "improved_pct": len(improved) / n,
-        # U_organic - U_rec over harmed agents = -(rec - organic).
-        "mean_orc": float(np.mean([-d for d in harmed])) if harmed else 0.0,
+        # U_organic - U_rec over harmed pairs = -(rec - organic).
+        "mean_orc": float(np.mean([-d for d in harmed])) if harmed else None,
         "n_matched": n,
     }
 
 
-def table2_metrics(rec_sim, organic_sim) -> Dict[str, float]:
+def table2_metrics(rec_sim, organic_sim) -> Dict[str, Optional[float]]:
     """Paper Table 2 (over-recommendation cost) for a treatment vs its matched
-    No-RS counterfactual, on the eval day.
-
-    Agents are matched by id over those who took a leisure trip in *both* runs.
-    Harmed % / Improved %: fraction whose eval-day leisure net utility is lower /
-    higher under the treatment than under No RS. Mean ORC: mean of
-    ``U_organic - U_rec`` over harmed agents only (Eq. 10).
-    """
+    No-RS counterfactual, on the eval day: see :func:`table2_from_utilities`."""
     return table2_from_utilities(
         eval_day_leisure_utilities(rec_sim.agents),
         eval_day_leisure_utilities(organic_sim.agents),
+        accepted=eval_day_accepted_ids(rec_sim.agents),
     )
 
 

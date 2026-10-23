@@ -1247,17 +1247,21 @@ SIM_DEFAULTS: dict = {
 }
 
 # Default welfare-gate thresholds: the optima of the gating threshold study
-# (gating_study/, 2026-10-12: Personalized, 8 metros x 2,000 agents x 30 days x
-# 10 seeds). PUP peaks at alpha 0.3 (utility 0.293, 5% abstention; flat from 0.1
-# to 0.6). RM epsilon is the 75th percentile of Standard RS's expected regret, the
-# best of the calibrated grid (0.288, 8% abstention; p80 is within 0.001).
-# STALE, both of them. They were calibrated on the old welfare layer, which
-# priced travel in dollars (8x the agent's utility scale), estimated V from the
-# ranking score, and gated only the agent's top-3 list. The gates now use the
-# agent's utility formula in utility units over the whole candidate pool, and RM
-# uses the paper's Eq. 18 regret (shortfall from the best candidate). Re-set
-# both from re-run sweeps.
+# (gating_study/, 2026-10-23: Personalized at proximity 0.10, common random
+# numbers, learned PUP sigma; 8 metros x 2,000 agents x 30 days x 5 seeds).
+# Mean eval-day utility: No RS 0.156, Standard 0.189. PUP rises with alpha to
+# 0.273 at alpha 0.8 (13% abstention) and abstains always from 0.9, where
+# Phi^-1(alpha) * sigma_0 exceeds every venue's estimate. RM is best at epsilon
+# 0 (0.337; looser epsilons are worse on utility, harmed % and ORC alike).
+# Both beat Standard in 40 of 40 (metro, seed) pairs.
 WELFARE_GATE_DEFAULTS: dict = {
-    "pup_alpha": 0.3,
-    "rm_epsilon": 0.2550,
+    "pup_alpha": 0.8,
+    "rm_epsilon": 0.0,
+    # PUP's sigma_i (TravelCostEstimator.get_user_uncertainty): the prior sigma_0
+    # is the RMSE of the platform's utility estimate U - U_hat over Standard
+    # RS's accepted recommendations (gating_study phase 1, 2026-10-22: 764,201
+    # recommendations); the strength is how many pseudo-observations it counts
+    # for, as the RS user model's prior_strength.
+    "pup_sigma_prior": 0.4981,
+    "pup_sigma_prior_strength": 2.0,
 }

@@ -91,6 +91,8 @@ class Simulation:
         sd = params.SIM_DEFAULTS
         cp = params.CITY_PARAMS
         self.seed = seed if seed is not None else sd["seed"]
+        # Set-up draws only (population, synthetic catalog). Daily behaviour draws
+        # from per-agent streams instead: see _agent_stream.
         self.rng = random.Random(self.seed)
         # Dedicated stream for home/work/fallback location sampling, so those
         # draws are independent of the main decision stream.
@@ -1242,10 +1244,28 @@ class Simulation:
             return 0.5
         return sum(self.mode_status[m] * c for m, c in self.last_mode_counts.items()) / total
 
+    def _agent_stream(self, purpose, agent, day_index):
+        """The random stream for one agent's ``purpose`` draws on one day.
+
+        Common random numbers across arms: every (agent, day, purpose) has its
+        own stream, so a draw only some arms make (accepting an offer, liking
+        it) cannot shift any other draw, and a difference on one day cannot
+        carry into the next day's draws. An agent's arms then differ only
+        through what the recommender actually changed, which is what the
+        matched No RS comparison of Table 2 needs. Seeded by string, which
+        Python hashes with SHA-512, so it does not depend on PYTHONHASHSEED.
+        """
+        return random.Random(f"{purpose}:{self.seed}:{agent.id}:{day_index}")
+
     def _plan_agents_for_day(self, day_index):
         rs_for_agent = self.recommender_stack if self.use_recommenders else None
         for agent in self.agents:
-            agent.plan_day(self, self.rng, recommender_stack=rs_for_agent, day_index=day_index)
+            # The day's travel and feedback draws, used by run_day.
+            agent.mode_rng = self._agent_stream("mode", agent, day_index)
+            agent.feedback_rng = self._agent_stream("feedback", agent, day_index)
+            agent.plan_day(self, self._agent_stream("plan", agent, day_index),
+                           recommender_stack=rs_for_agent, day_index=day_index,
+                           accept_rng=self._agent_stream("accept", agent, day_index))
 
     def run_days(self, num_days=7, progress=None, on_day_complete=None, should_stop=None):
         """Run ``num_days`` days. If ``should_stop`` is given and returns True at
@@ -1853,11 +1873,11 @@ class Simulation:
         modes = list(outcomes)
         return dict(zip(modes, softmax([outcomes[m]["utility"] for m in modes])))
 
-    def _choose_mode_utility(self, outcomes):
+    def _choose_mode_utility(self, outcomes, rng):
         modes = list(outcomes.keys())
         utilities = [outcomes[m]["utility"] for m in modes]
         probs = softmax(utilities)
-        return self.rng.choices(modes, weights=probs, k=1)[0]
+        return rng.choices(modes, weights=probs, k=1)[0]
 
     @staticmethod
     def _rrm_probabilities(outcomes):
@@ -1921,12 +1941,12 @@ class Simulation:
             return {self._utility_gap_regret_pick(outcomes): 1.0}
         raise ValueError(f"unknown regret_rule {rule!r}")
 
-    def _choose_mode_regret(self, outcomes):
+    def _choose_mode_regret(self, outcomes, rng):
         probs = self._regret_probabilities(outcomes)
         modes = list(probs)
         if len(modes) == 1:
             return modes[0]
-        return self.rng.choices(modes, weights=[probs[m] for m in modes], k=1)[0]
+        return rng.choices(modes, weights=[probs[m] for m in modes], k=1)[0]
 
     def _choose_mode_prospect(self, outcomes, agent):
         ref_time = agent.reference_points["time_min"]
@@ -1964,14 +1984,14 @@ class Simulation:
         a fixed order would decide the outcome, and MODE_PARAMS lists walk first.
         """
         order = list(outcomes)
-        self.rng.shuffle(order)
+        agent.mode_rng.shuffle(order)
         if agent.habit_mode in outcomes:
             order.remove(agent.habit_mode)
             order.insert(0, agent.habit_mode)
         for mode in order:
             if outcomes[mode]["full_cost"] <= agent.satisficing_threshold:
                 return mode
-        return self._choose_mode_utility(outcomes)
+        return self._choose_mode_utility(outcomes, agent.mode_rng)
 
     def choose_mode(self, agent, current_activity, next_activity):
         """Choose the mode for a departure now. Returns ``(mode, outcome)``."""
@@ -1981,7 +2001,7 @@ class Simulation:
             return mode, outcomes[mode]
         paradigm = agent.decision_paradigms.get("mode_choice", "utility")
         if paradigm == "regret":
-            mode = self._choose_mode_regret(outcomes)
+            mode = self._choose_mode_regret(outcomes, agent.mode_rng)
         elif paradigm == "prospect":
             mode = self._choose_mode_prospect(outcomes, agent)
         elif paradigm == "satisficing":
@@ -1989,7 +2009,7 @@ class Simulation:
         elif paradigm == "habit" and agent.habit_mode in outcomes:
             mode = agent.habit_mode
         else:
-            mode = self._choose_mode_utility(outcomes)
+            mode = self._choose_mode_utility(outcomes, agent.mode_rng)
         return mode, outcomes[mode]
 
     # ── Visualisation ────────────────────────────────────────────────────────
@@ -2003,7 +2023,7 @@ class Simulation:
                                          self._true_point(agent, trip.destination))
 
     def _record_recommendation_feedback(self, agent, feedback_trip, feedback_params):
-        liked, p_like = agent.evaluate_recommendation_feedback(feedback_trip, self, self.rng)
+        liked, p_like = agent.evaluate_recommendation_feedback(feedback_trip, self, agent.feedback_rng)
         feedback_trip.user_feedback_like = liked
         # Public review: the like/dislike also moves the POI's live rating and
         # review count, which every recommender scores with from now on.

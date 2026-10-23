@@ -829,7 +829,7 @@ class Agent:
 
     # ── Day planning ─────────────────────────────────────────────────────────
 
-    def plan_day(self, env, rng, recommender_stack=None, day_index=0):
+    def plan_day(self, env, rng, recommender_stack=None, day_index=0, accept_rng=None):
         """Generate a daily activity schedule with RS-driven leisure choices.
 
         ``env`` is the owning :class:`welfare_rs.Simulation` — it provides the
@@ -1050,7 +1050,7 @@ class Agent:
                 # needs routing here.
                 delta_cost = offered_cost - chosen["trip_disutility"]
                 eta = self._estimate_eta(best_rec.score, delta_cost=delta_cost)
-                accepted = rng.random() < eta
+                accepted = (accept_rng or rng).random() < eta
                 if accepted:
                     chosen_location = best_rec.place.location
                     chosen_place_id = best_rec.place.place_id

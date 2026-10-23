@@ -65,7 +65,7 @@ export interface Table2Row {
   condition: string;
   harmed_pct: number;
   improved_pct: number;
-  mean_orc: number;
+  mean_orc: number | null;  // null when no pair was harmed
   n_matched: number;
 }
 
