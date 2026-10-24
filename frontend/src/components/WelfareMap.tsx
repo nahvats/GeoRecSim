@@ -14,6 +14,10 @@ const MAP_STYLE = "https://basemaps.cartocdn.com/gl/positron-gl-style/style.json
  * utility versus the No-RS control. Hexagons average those deltas, so a cell
  * answers "for people who live here, did this recommender help or hurt".
  *
+ * Any two conditions can be compared. Every delta is already relative to the
+ * control, so the control's own delta is zero and A-versus-B is delta[A] −
+ * delta[B] for agents who went out under both.
+ *
  * Averaged, never summed: a hexagon over a dense residential block holds far
  * more agents than one in the outer counties, and a sum would render population
  * density as welfare impact.
@@ -38,33 +42,54 @@ function quantile(sorted: number[], q: number): number {
   return lo === hi ? sorted[lo] : sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
 }
 
+interface MapPoint {
+  lat: number;
+  lon: number;
+  value: number;
+}
+
 export default function WelfareMap({
   run,
   conditions,
+  control,
 }: {
   run: RunMeta;
   conditions: string[];
+  control: string;
 }) {
-  const [condition, setCondition] = useState(conditions[0] ?? "");
+  const [conditionPick, setCondition] = useState(
+    conditions.find((c) => c !== control) ?? control
+  );
+  const [baselinePick, setBaseline] = useState(control);
+  const condition = conditions.includes(conditionPick)
+    ? conditionPick
+    : conditions.find((c) => c !== control) ?? control;
+  const baseline = conditions.includes(baselinePick) ? baselinePick : control;
   const [radius, setRadius] = useState(600);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<maplibregl.Map | null>(null);
   const overlayRef = useRef<MapboxOverlay | null>(null);
 
   const rows: WelfareMapRow[] = run.welfare_map ?? [];
-  const points = useMemo(
-    () => rows.filter((r) => r.delta[condition] != null),
-    [rows, condition]
-  );
+  const points = useMemo<MapPoint[]>(() => {
+    const deltaOf = (r: WelfareMapRow, c: string) => (c === control ? 0 : r.delta[c]);
+    const out: MapPoint[] = [];
+    for (const r of rows) {
+      const a = deltaOf(r, condition);
+      const b = deltaOf(r, baseline);
+      if (a != null && b != null) out.push({ lat: r.lat, lon: r.lon, value: a - b });
+    }
+    return out;
+  }, [rows, condition, baseline, control]);
 
   // Symmetric colour domain from the 5th/95th percentile of |delta|, so a
   // single outlier cannot flatten the whole map to one shade, and zero always
   // sits at the palette's midpoint (otherwise "blue" would not mean "better").
   const domain = useMemo<[number, number]>(() => {
-    const values = points.map((p) => Math.abs(p.delta[condition])).sort((a, b) => a - b);
+    const values = points.map((p) => Math.abs(p.value)).sort((a, b) => a - b);
     const extent = Math.max(1e-4, quantile(values, 0.95));
     return [-extent, extent];
-  }, [points, condition]);
+  }, [points]);
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
@@ -92,11 +117,11 @@ export default function WelfareMap({
     if (!overlay) return;
     overlay.setProps({
       layers: [
-        new HexagonLayer<WelfareMapRow>({
-          id: `welfare-${condition}-${radius}`,
+        new HexagonLayer<MapPoint>({
+          id: `welfare-${condition}-${baseline}-${radius}`,
           data: points,
           getPosition: (d) => [d.lon, d.lat],
-          getColorWeight: (d) => d.delta[condition],
+          getColorWeight: (d) => d.value,
           colorAggregation: "MEAN",
           radius,
           coverage: 0.92,
@@ -117,7 +142,7 @@ export default function WelfareMap({
         };
       },
     });
-  }, [points, condition, radius, domain]);
+  }, [points, condition, baseline, radius, domain]);
 
   if (!rows.length) {
     return (
@@ -132,14 +157,24 @@ export default function WelfareMap({
     <div className="welfare-map">
       <div className="welfare-map-controls">
         {conditions.length > 1 && (
-          <label className="inline-picker">
-            Condition
-            <select value={condition} onChange={(e) => setCondition(e.target.value)}>
-              {conditions.map((c) => (
-                <option key={c} value={c}>{condLabel(c)}</option>
-              ))}
-            </select>
-          </label>
+          <>
+            <label className="inline-picker">
+              Condition
+              <select value={condition} onChange={(e) => setCondition(e.target.value)}>
+                {conditions.map((c) => (
+                  <option key={c} value={c}>{condLabel(c)}</option>
+                ))}
+              </select>
+            </label>
+            <label className="inline-picker">
+              Versus
+              <select value={baseline} onChange={(e) => setBaseline(e.target.value)}>
+                {conditions.map((c) => (
+                  <option key={c} value={c}>{condLabel(c)}</option>
+                ))}
+              </select>
+            </label>
+          </>
         )}
         <label className="inline-picker">
           Hex size
@@ -150,13 +185,19 @@ export default function WelfareMap({
             <option value={2500}>2.5 km</option>
           </select>
         </label>
-        <span className="muted small">{points.length.toLocaleString()} agents mapped</span>
+        <span className="muted small">
+          {points.length.toLocaleString()} agents mapped
+          {condition === baseline ? " · same condition on both sides, so every cell is zero" : ""}
+        </span>
       </div>
       <div ref={containerRef} className="welfare-map-canvas" />
       <div className="welfare-legend">
         <span className="muted small">worse off</span>
         <span className="legend-ramp" />
         <span className="muted small">better off</span>
+        <span className="muted small">
+          under {condLabel(condition)} vs {condLabel(baseline)}
+        </span>
         <span className="muted small legend-range">
           ±{Math.abs(domain[1]).toFixed(2)} utility
         </span>

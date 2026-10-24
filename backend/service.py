@@ -768,6 +768,8 @@ class RunConfig:
             # PUP's sigma prior is a gate parameter that the specs do not carry.
             round(params.WELFARE_GATE_DEFAULTS["pup_sigma_prior"], 4),
             round(params.WELFARE_GATE_DEFAULTS["pup_sigma_prior_strength"], 4),
+            ("candidate_pool", params.WELFARE_GATE_DEFAULTS["candidate_pool"]),
+            "rm_catalog_benchmark",
         )
         return hashlib.sha1(repr(key).encode()).hexdigest()[:16]
 

@@ -601,11 +601,13 @@ RECOMMENDER_PRESETS: Dict[str, Dict[str, float]] = {
     },
     # Proximity lowered 0.20 -> 0.10 on 2026-10-22: net utility is mostly travel
     # cost, so at 0.20 the ungated ranking was already close to welfare-optimal
-    # and the gates had little to improve on. Studies run at 0.20 stay in the
-    # website's Storage tab for sensitivity analysis.
+    # and the gates had little to improve on. Raised to 0.115 (25% of the base
+    # score) on 2026-10-23, which puts Standard RS at a mean eval-day utility of
+    # 0.226 (2,000 agents x 30 days, 8 metros x 2 seeds; 0.10 gave 0.191, 0.12
+    # gave 0.233). Studies run at other values stay in the website's Storage tab.
     "Personalized": {
         "w_rating": 0.15, "w_relevance": 0.10,
-        "w_proximity": 0.10, "w_popularity": 0.10, "personalization_lambda": 0.35,
+        "w_proximity": 0.115, "w_popularity": 0.10, "personalization_lambda": 0.35,
         "distance_scale_km": 5.0, "popularity_gamma": 1.0,
     },
     "Viral": {

@@ -369,39 +369,35 @@ class WelfareAnnotatedRecommendation:
     regret: float
     passed_pup: bool
     passed_rm: bool
-    #: The platform's estimate of the agent's organic alternative (see
-    #: WelfareAwareOrchestrator), or None when it has no candidates to average.
-    u_hat_organic: Optional[float] = None
+    #: The best Û over every venue of the subtype: RM's benchmark.
+    u_hat_best: Optional[float] = None
 
 
 class WelfareAwareOrchestrator:
     """Wraps LeisureRSOrchestrator with PUP/RM gating.
 
     The pool is the ``candidate_pool`` best-scored venues of the subtype (all
-    of them when None): the venues the platform is willing to offer. Each is
+    of them when None): the shortlist the platform is willing to offer. Each is
     annotated with Û = V̂ − Ĉ, its PUP and its regret (Uğurel & Yabe 2026,
     Eqs. 6 and 18)
 
-        R̂_k = max(Û_org, max_j Û_j) − Û_k,   j over the pool,
+        R̂_k = max_j Û_j − Û_k,   j over EVERY venue of the subtype,
 
-    where Û_org is the agent's organic alternative as the platform estimates
-    it: Û averaged over every venue of the subtype, each weighted by how likely
-    the agent is to pick it unaided, ``exp(-d / organic_poi_proximity_scale_km)``
-    (the same proximity draw as Simulation.sample_poi). The gate drops the
-    candidates that fail it and returns the ``top_k_per_system`` best-scored
-    survivors, so the agent is offered the highest-scoring admissible venue
-    (Eqs. 9 and 10).
-
-    Û_org is an average of the same estimates, so it can only exceed the best
-    candidate when the pool leaves out venues the agent might pick itself. With
-    ``candidate_pool=None`` it never does, and RM never abstains.
+    how far the candidate falls short of the best venue the platform knows of
+    (the paper's "best available activity ... over the full set A"). The
+    benchmark uses only what a platform has, its catalog and its own estimates,
+    never the user's unobserved organic choice. It is also not the shortlist's
+    own best, which would always pass with zero regret and make RM unable to
+    abstain. The gate drops the candidates that fail and returns the
+    ``top_k_per_system`` best-scored survivors, so the agent is offered the
+    highest-scoring admissible venue, or nothing (Eqs. 9 and 10).
 
     Treatment modes:
     - "standard": pass-through (no welfare filtering)
     - "pup": filter recommendations where PUP < α
     - "rm": filter recommendations whose regret exceeds ε. At ε = 0 it offers
-      the candidate with the highest Û if that beats the organic alternative,
-      and abstains otherwise; as ε grows it becomes Standard.
+      a venue only when the shortlist holds the catalog's best, and abstains
+      otherwise; as ε grows it becomes Standard.
     - "pup_rm": apply both constraints
     """
 
@@ -414,8 +410,7 @@ class WelfareAwareOrchestrator:
         rm_epsilon: float = params.WELFARE_GATE_DEFAULTS["rm_epsilon"],
         coord_scale_km: float = 1.0,
         coord_distance_km=haversine_km,
-        candidate_pool: Optional[int] = 20,
-        organic_reference: bool = True,
+        candidate_pool: Optional[int] = params.WELFARE_GATE_DEFAULTS["candidate_pool"],
     ):
         self.base = base_orchestrator
         self.tce = travel_cost_estimator
@@ -425,11 +420,9 @@ class WelfareAwareOrchestrator:
         self.coord_scale_km = coord_scale_km
         # Straight-line (lat, lon) distance in km for the travel-cost estimate.
         self.coord_distance_km = coord_distance_km
-        # How many of the best-scored candidates the gate may offer, and so
-        # takes the best Û of. None = every candidate of the subtype.
+        # How many of the best-scored candidates the gate may offer.
+        # None = every candidate of the subtype.
         self.candidate_pool = candidate_pool
-        # Whether the regret's benchmark includes the organic alternative.
-        self.organic_reference = organic_reference
         # Feedback history for continuous learning
         self.feedback_history: List[ContinuousFeedback] = []
         # user_id -> {place_id: Û} of the venues last offered to the user, so
@@ -449,11 +442,10 @@ class WelfareAwareOrchestrator:
         ``top_k_per_system`` best-scored survivors per source.
         """
         pool = max(self.candidate_pool or sys.maxsize, top_k_per_system)
-        # Every candidate, not just the pool: the organic alternative ranges
-        # over all of them.
+        # Every candidate, not just the pool: RM's benchmark ranges over all
+        # of them.
         base_recs = self.base.recommend(user, leisure_subtype, sys.maxsize)
         sigma_i = self.tce.get_user_uncertainty(user.user_id)
-        scale_km = params.CITY_PARAMS.get("organic_poi_proximity_scale_km", 3.0) or 1.0
 
         annotated: Dict[str, List[WelfareAnnotatedRecommendation]] = {}
         for source, recs in base_recs.items():
@@ -465,23 +457,12 @@ class WelfareAwareOrchestrator:
             c_hats = self.tce.estimate_travel_costs(user.user_id, dists)
             u_hats = [v - c for v, c in zip(v_hats, c_hats)]
 
-            u_hat_organic = None
-            if self.organic_reference:
-                weights = [math.exp(-d / scale_km) for d in dists]
-                total_weight = sum(weights)
-                if total_weight > 0:
-                    u_hat_organic = sum(w * u for w, u in zip(weights, u_hats)) / total_weight
-
-            # RM compares each offerable candidate with the best of the pool
-            # and the organic alternative.
+            # RM's benchmark: the best estimate over the whole catalog, taken
+            # once here rather than inside compute_regret for every candidate.
+            u_hat_best = max(u_hats) if u_hats else None
+            best = (u_hat_best,)
             u_hats = u_hats[:pool]
             estimates = list(zip(recs, v_hats, c_hats))[:pool]
-            benchmark = list(u_hats)
-            if u_hat_organic is not None:
-                benchmark.append(u_hat_organic)
-            # The max is taken once here rather than inside compute_regret for
-            # every candidate, which is quadratic over a full pool.
-            best = (max(benchmark),)
             annotated_list = []
             for (rec, v_hat_act, c_hat_travel), u_hat in zip(estimates, u_hats):
                 pup = compute_pup(v_hat_act, c_hat_travel, sigma_i)
@@ -499,7 +480,7 @@ class WelfareAwareOrchestrator:
                         regret=regret,
                         passed_pup=passed_pup,
                         passed_rm=passed_rm,
-                        u_hat_organic=u_hat_organic,
+                        u_hat_best=u_hat_best,
                     )
                 )
 

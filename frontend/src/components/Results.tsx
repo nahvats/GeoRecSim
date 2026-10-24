@@ -359,7 +359,7 @@ function Geography({
       </Panel>
 
       <Panel title="Where the winners and losers live" wide>
-        <WelfareMap run={run} conditions={treated} />
+        <WelfareMap run={run} conditions={run.conditions} control={control} />
       </Panel>
     </div>
   );
@@ -403,7 +403,12 @@ function WhoGainsLoses({
     return [...seen].sort();
   }, [run.conditions, metrics]);
 
-  const [heatCondition, setHeatCondition] = useState(treated[0] ?? control);
+  // Any two conditions can be compared, No RS included on either side. The
+  // includes() guards cover a new run arriving while this panel stays mounted.
+  const [heatPick, setHeatCondition] = useState(treated[0] ?? control);
+  const [basePick, setHeatBaseline] = useState(control);
+  const heatCondition = run.conditions.includes(heatPick) ? heatPick : treated[0] ?? control;
+  const heatBaseline = run.conditions.includes(basePick) ? basePick : control;
 
   function shareDelta(band: string, category: string): number | null {
     const share = (cond: string) => {
@@ -413,7 +418,7 @@ function WhoGainsLoses({
       return total > 0 ? (row[category] ?? 0) / total : null;
     };
     const a = share(heatCondition);
-    const b = share(control);
+    const b = share(heatBaseline);
     return a == null || b == null ? null : (a - b) * 100;
   }
 
@@ -431,16 +436,27 @@ function WhoGainsLoses({
 
       <Panel
         title="What each income group ends up visiting"
-        hint={<>Change in the share of a band's leisure visits going to each venue type, in percentage points versus <b>{condLabel(control)}</b>. Blue means the recommender sends that group there more often than they would have gone on their own.</>}
+        hint={<>Change in the share of a band's leisure visits going to each venue type, in percentage points, <b>{condLabel(heatCondition)}</b> versus <b>{condLabel(heatBaseline)}</b>. Blue means that group goes there more often under {condLabel(heatCondition)} than under {condLabel(heatBaseline)}.</>}
         wide
       >
-        {treated.length > 1 && (
-          <label className="inline-picker">
-            Condition
-            <select value={heatCondition} onChange={(e) => setHeatCondition(e.target.value)}>
-              {treated.map((c) => <option key={c} value={c}>{condLabel(c)}</option>)}
-            </select>
-          </label>
+        {run.conditions.length > 1 && (
+          <>
+            <label className="inline-picker">
+              Condition
+              <select value={heatCondition} onChange={(e) => setHeatCondition(e.target.value)}>
+                {run.conditions.map((c) => <option key={c} value={c}>{condLabel(c)}</option>)}
+              </select>
+            </label>
+            <label className="inline-picker">
+              Versus
+              <select value={heatBaseline} onChange={(e) => setHeatBaseline(e.target.value)}>
+                {run.conditions.map((c) => <option key={c} value={c}>{condLabel(c)}</option>)}
+              </select>
+            </label>
+            {heatCondition === heatBaseline && (
+              <p className="muted small">Same condition on both sides, so every cell is zero.</p>
+            )}
+          </>
         )}
         <DivergingHeatmap
           rows={bands}

@@ -1247,21 +1247,25 @@ SIM_DEFAULTS: dict = {
 }
 
 # Default welfare-gate thresholds: the optima of the gating threshold study
-# (gating_study/, 2026-10-23: Personalized at proximity 0.10, common random
-# numbers, learned PUP sigma; 8 metros x 2,000 agents x 30 days x 5 seeds).
-# Mean eval-day utility: No RS 0.156, Standard 0.189. PUP rises with alpha to
-# 0.273 at alpha 0.8 (13% abstention) and abstains always from 0.9, where
-# Phi^-1(alpha) * sigma_0 exceeds every venue's estimate. RM is best at epsilon
-# 0 (0.337; looser epsilons are worse on utility, harmed % and ORC alike).
-# Both beat Standard in 40 of 40 (metro, seed) pairs.
+# (gating_study/, 2026-10-24: Personalized at proximity 0.115, common random
+# numbers, learned PUP sigma, RM regret from the catalog's best venue, a
+# 10-venue shortlist; 8 metros x 2,000 agents x 30 days x 5 seeds).
+# Mean eval-day utility: No RS 0.156, Standard 0.224, Oracle 0.376. PUP rises
+# with alpha to 0.277 at alpha 0.8 (10.7% abstention), then falls (0.9: 0.236,
+# 44%; 1.0: always abstains). RM rises from 0.230 at epsilon 0 (62% abstention)
+# to 0.309 at p50-p60 (epsilon 0.055-0.086; 11% and 5.5% abstention, a tie) and
+# falls to 0.270 at p90. Both beat Standard in every seed.
 WELFARE_GATE_DEFAULTS: dict = {
     "pup_alpha": 0.8,
-    "rm_epsilon": 0.0,
+    "rm_epsilon": 0.0864,
     # PUP's sigma_i (TravelCostEstimator.get_user_uncertainty): the prior sigma_0
     # is the RMSE of the platform's utility estimate U - U_hat over Standard
-    # RS's accepted recommendations (gating_study phase 1, 2026-10-22: 764,201
+    # RS's accepted recommendations (gating_study phase 1, 2026-10-24: 775,459
     # recommendations); the strength is how many pseudo-observations it counts
     # for, as the RS user model's prior_strength.
-    "pup_sigma_prior": 0.4981,
+    "pup_sigma_prior": 0.4284,
     "pup_sigma_prior_strength": 2.0,
+    # How many of the RS's best-scored venues the gate may offer: a first page
+    # of results. RM measures each against the best venue of the whole catalog.
+    "candidate_pool": 10,
 }
