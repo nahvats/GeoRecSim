@@ -1247,24 +1247,40 @@ SIM_DEFAULTS: dict = {
 }
 
 # Default welfare-gate thresholds: the optima of the gating threshold study
-# (gating_study/, 2026-10-24: Personalized at proximity 0.115, common random
+# (gating_study/, 2026-10-25: Personalized at proximity 0.115, common random
 # numbers, learned PUP sigma, RM regret from the catalog's best venue, a
-# 10-venue shortlist; 8 metros x 2,000 agents x 30 days x 5 seeds).
+# 10-venue shortlist, value of time learned by regression on travel time;
+# 8 metros x 2,000 agents x 30 days x 5 seeds).
 # Mean eval-day utility: No RS 0.156, Standard 0.224, Oracle 0.376. PUP rises
-# with alpha to 0.277 at alpha 0.8 (10.7% abstention), then falls (0.9: 0.236,
-# 44%; 1.0: always abstains). RM rises from 0.230 at epsilon 0 (62% abstention)
-# to 0.309 at p50-p60 (epsilon 0.055-0.086; 11% and 5.5% abstention, a tie) and
-# falls to 0.270 at p90. Both beat Standard in every seed.
+# with alpha to 0.277 at alpha 0.8 (9.5% abstention), then falls (0.9: 0.264,
+# 23%; 1.0: always abstains). RM rises from 0.230 at epsilon 0 (62% abstention)
+# to 0.310 at p60 (epsilon 0.0825, 5.4% abstention; p50 0.309, a tie) and
+# falls to 0.273 at p90. Both beat Standard in 40 of 40 (metro, seed) pairs.
 WELFARE_GATE_DEFAULTS: dict = {
     "pup_alpha": 0.8,
-    "rm_epsilon": 0.0864,
+    "rm_epsilon": 0.0825,
     # PUP's sigma_i (TravelCostEstimator.get_user_uncertainty): the prior sigma_0
     # is the RMSE of the platform's utility estimate U - U_hat over Standard
-    # RS's accepted recommendations (gating_study phase 1, 2026-10-24: 775,459
+    # RS's accepted recommendations (gating_study phase 1, 2026-10-25: 775,459
     # recommendations); the strength is how many pseudo-observations it counts
     # for, as the RS user model's prior_strength.
-    "pup_sigma_prior": 0.4284,
+    "pup_sigma_prior": 0.3641,
     "pup_sigma_prior_strength": 2.0,
+    # The platform's value of time v_hat (TravelCostEstimator), learned per
+    # user by Bayesian linear regression of its prediction errors on its own
+    # travel-time estimates (paper B.3). The prior mean is the paper's cold
+    # start, $15/h (~50% of the median wage, USDOT 2016 guidance; paper C.2),
+    # bounded to the paper's $5-50/h. vot_prior_sd is how far a user's VOT
+    # may sit from it a priori, and vot_noise_sd is the residual s.d. of
+    # U - U_hat (sigma_0 as calibrated before this learner, 2026-10-24; kept
+    # so the prior strength is the one the threshold study ran with); only
+    # their ratio matters. The regression's
+    # intercept, the user's mean taste error, has a flat prior, so taste
+    # cannot move v_hat: only trips of different lengths can.
+    "vot_prior_mean": 15.0,
+    "vot_prior_sd": 10.0,
+    "vot_noise_sd": 0.43,
+    "vot_bounds": (5.0, 50.0),
     # How many of the RS's best-scored venues the gate may offer: a first page
     # of results. RM measures each against the best venue of the whole catalog.
     "candidate_pool": 10,

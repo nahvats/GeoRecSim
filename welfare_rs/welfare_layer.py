@@ -128,8 +128,30 @@ class TravelCostEstimator:
     - the time/cost weights and the trip-burden multiplier: 1, the population
       mean.
 
-    Value of time is updated from continuous feedback: dissatisfaction with a
-    long trip raises it 5%, satisfaction with one lowers it 3% (paper B.3).
+    Value of time is learned from travel, never from the like: by Bayesian
+    linear regression of the platform's prediction errors on its own
+    travel-time estimates (paper B.3). For a recommendation the user took,
+    with Û, τ̂ and v̂ as they were when it was offered, and realized U,
+
+        y = U − Û + x · v̂,   x = −τ̂ / (60 · gen_cost_denominator)
+
+    is U − V̂ + κ̂ / gen_cost_denominator, so the model
+
+        y = a + x · v + noise
+
+    has the user's value of time v as its slope on travel time. The intercept
+    a is the user's mean taste error (V − V̂): it absorbs how much more or
+    less the user enjoys the venues than estimated. It has a flat prior, so
+    taste cannot move v̂, and only trips of different lengths can. With the
+    prior v ~ N(v₀, s_v²) and residual s.d. s_e, v̂ is the posterior mean of
+    v, bounded to ``vot_bounds``:
+
+        v̂ = (λ v₀ + Sxy − Sx·Sy/n) / (λ + Sxx − Sx²/n),   λ = (s_e / s_v)²
+
+    A user with no feedback, or whose trips are all the same length, stays at
+    the prior v₀. The learned v is what makes Ĉ
+    best predict the user's U: their value of time times their time weight,
+    and any systematic gap between τ̂ and the real door-to-door time.
 
     The uncertainty σ_i of PUP is learned from the platform's prediction errors
     (paper Eq. 17): see :meth:`get_user_uncertainty`.
@@ -137,59 +159,72 @@ class TravelCostEstimator:
 
     def __init__(
         self,
-        default_vot: float = 15.0,
-        learning_rate: float = 0.15,
+        default_vot: float = params.WELFARE_GATE_DEFAULTS["vot_prior_mean"],
         metro: Optional[str] = None,
         default_mode: str = "car",
         sigma_prior: float = params.WELFARE_GATE_DEFAULTS["pup_sigma_prior"],
         sigma_prior_strength: float = params.WELFARE_GATE_DEFAULTS["pup_sigma_prior_strength"],
+        vot_prior_sd: float = params.WELFARE_GATE_DEFAULTS["vot_prior_sd"],
+        vot_noise_sd: float = params.WELFARE_GATE_DEFAULTS["vot_noise_sd"],
+        vot_bounds: Tuple[float, float] = params.WELFARE_GATE_DEFAULTS["vot_bounds"],
     ):
         self.default_vot = default_vot
-        self.learning_rate = learning_rate
         self.metro = metro
         self.default_mode = default_mode
         self.sigma_prior = sigma_prior
         self.sigma_prior_strength = sigma_prior_strength
-        # Per-user state: {user_id: {"vot": float, "avg_travel_cost": float,
-        # "n": int, "modes": Counter, "sq_err": float, "n_err": int}}
+        # The prior precision of v, in units of the residual variance.
+        self.vot_prior_precision = (vot_noise_sd / vot_prior_sd) ** 2
+        self.vot_bounds = vot_bounds
+        # Per-user state: {user_id: {"vot": float, "n": int, "sx": float,
+        # "sxx": float, "sy": float, "sxy": float, "modes": Counter,
+        # "sq_err": float, "n_err": int}}; n and the s* are the regression's
+        # sufficient statistics.
         self.user_estimates: Dict[int, Dict[str, float]] = {}
 
     def _state(self, user_id: int) -> Dict[str, float]:
         return self.user_estimates.setdefault(
             user_id,
-            {"vot": self.default_vot, "avg_travel_cost": 0.0, "n": 0, "modes": Counter(),
-             "sq_err": 0.0, "n_err": 0},
+            {"vot": self.default_vot, "n": 0, "sx": 0.0, "sxx": 0.0, "sy": 0.0, "sxy": 0.0,
+             "modes": Counter(), "sq_err": 0.0, "n_err": 0},
         )
 
     def update(
         self,
-        feedback: ContinuousFeedback,
-        travel_time_min: float,
-        monetary_cost: float,
+        user_id: int,
+        realized_utility: float,
+        offered: Optional[Tuple[float, float, float]] = None,
         mode: Optional[str] = None,
     ) -> None:
-        """Update user travel cost estimates from a feedback observation.
+        """Learn from one recommendation the user took.
 
-        ``mode`` is how the user travelled to the venue, which a platform that
-        sent them there observes."""
-        state = self._state(feedback.user_id)
-        state["n"] += 1
+        ``offered`` is ``(Û, τ̂, v̂)`` of the venue when it was offered: the
+        platform's net-utility estimate, its travel-time estimate in minutes and
+        the value of time that estimate used. ``mode`` is how the user travelled
+        to the venue, which a platform that sent them there observes."""
+        state = self._state(user_id)
         if mode:
             state["modes"][mode] += 1
-        alpha = self.learning_rate
+        if offered is None:
+            return
+        u_hat, tau_hat, vot_hat = offered
+        x = -tau_hat / (60.0 * params.UTILITY_WEIGHTS["gen_cost_denominator"])
+        y = realized_utility - u_hat + x * vot_hat
+        state["n"] += 1
+        state["sx"] += x
+        state["sxx"] += x * x
+        state["sy"] += y
+        state["sxy"] += x * y
 
-        # Update average travel cost with EMA
-        realized_gc = monetary_cost + (travel_time_min / 60.0) * state["vot"]
-        state["avg_travel_cost"] = (1 - alpha) * state["avg_travel_cost"] + alpha * realized_gc
-
-        # Update VOT estimate: if user dislikes high-time trips, infer higher VOT
-        # Simple heuristic: satisfaction < 0 on high-time trips → increase VOT
-        if travel_time_min > 0 and feedback.satisfaction < -0.2:
-            # User disliked a costly trip → they value time more
-            state["vot"] = min(50.0, state["vot"] * (1 + 0.05 * abs(feedback.satisfaction)))
-        elif travel_time_min > 20 and feedback.satisfaction > 0.3:
-            # User liked a long trip → they don't mind travel as much
-            state["vot"] = max(5.0, state["vot"] * (1 - 0.03 * feedback.satisfaction))
+        # Posterior mean of v with the intercept integrated out: the
+        # regression on the user's centred travel times.
+        n = state["n"]
+        lam = self.vot_prior_precision
+        sxx = state["sxx"] - state["sx"] * state["sx"] / n
+        sxy = state["sxy"] - state["sx"] * state["sy"] / n
+        vot = (lam * self.default_vot + sxy) / (lam + sxx)
+        lo, hi = self.vot_bounds
+        state["vot"] = min(hi, max(lo, vot))
 
     def estimated_mode(self, user_id: int) -> str:
         """The mode this user took most often on the trips the platform saw
@@ -225,11 +260,9 @@ class TravelCostEstimator:
     def estimate_travel_costs(self, user_id: int, distances_km: Sequence[float]) -> List[float]:
         """:meth:`estimate_travel_cost` for many venues at once: the user's mode
         and value of time are looked up once, not once per venue."""
-        state = self.user_estimates.get(user_id)
-        vot = self.default_vot if state is None else state["vot"]
         mode = self.estimated_mode(user_id)
         spec = params.MODE_PARAMS[mode]
-        per_min = vot / 60.0
+        per_min = self.get_user_vot(user_id) / 60.0
         speed = spec["speed_kmh"]
         wait = spec["wait_min"]
         denom = params.UTILITY_WEIGHTS["gen_cost_denominator"]
@@ -238,6 +271,11 @@ class TravelCostEstimator:
             in_vehicle_min = d / speed * 60.0
             out.append(((in_vehicle_min + wait) * per_min + self._money(mode, d, in_vehicle_min)) / denom)
         return out
+
+    def estimate_travel_times(self, user_id: int, distances_km: Sequence[float]) -> List[float]:
+        """τ̂ in minutes, as :meth:`estimate_travel_costs` prices it."""
+        spec = params.MODE_PARAMS[self.estimated_mode(user_id)]
+        return [d / spec["speed_kmh"] * 60.0 + spec["wait_min"] for d in distances_km]
 
     def get_user_vot(self, user_id: int) -> float:
         """Return estimated VOT for a user."""
@@ -371,6 +409,8 @@ class WelfareAnnotatedRecommendation:
     passed_rm: bool
     #: The best Û over every venue of the subtype: RM's benchmark.
     u_hat_best: Optional[float] = None
+    #: τ̂, the travel time in minutes that ``c_hat_travel`` priced.
+    tau_hat: Optional[float] = None
 
 
 class WelfareAwareOrchestrator:
@@ -425,9 +465,10 @@ class WelfareAwareOrchestrator:
         self.candidate_pool = candidate_pool
         # Feedback history for continuous learning
         self.feedback_history: List[ContinuousFeedback] = []
-        # user_id -> {place_id: Û} of the venues last offered to the user, so
-        # the feedback on the one taken can be scored against its estimate.
-        self._offered_u_hat: Dict[int, Dict[str, float]] = {}
+        # user_id -> {place_id: (Û, τ̂, v̂)} of the venues last offered to the
+        # user, so the feedback on the one taken can be scored against the
+        # estimate it was offered with.
+        self._offered: Dict[int, Dict[str, Tuple[float, float, float]]] = {}
 
     def recommend(
         self,
@@ -462,9 +503,10 @@ class WelfareAwareOrchestrator:
             u_hat_best = max(u_hats) if u_hats else None
             best = (u_hat_best,)
             u_hats = u_hats[:pool]
-            estimates = list(zip(recs, v_hats, c_hats))[:pool]
+            tau_hats = self.tce.estimate_travel_times(user.user_id, dists[:pool])
+            estimates = list(zip(recs, v_hats, c_hats, tau_hats))[:pool]
             annotated_list = []
-            for (rec, v_hat_act, c_hat_travel), u_hat in zip(estimates, u_hats):
+            for (rec, v_hat_act, c_hat_travel, tau_hat), u_hat in zip(estimates, u_hats):
                 pup = compute_pup(v_hat_act, c_hat_travel, sigma_i)
                 regret = compute_regret(u_hat, best)
 
@@ -481,6 +523,7 @@ class WelfareAwareOrchestrator:
                         passed_pup=passed_pup,
                         passed_rm=passed_rm,
                         u_hat_best=u_hat_best,
+                        tau_hat=tau_hat,
                     )
                 )
 
@@ -496,8 +539,9 @@ class WelfareAwareOrchestrator:
             # The pool arrives sorted by score, and filtering keeps that order.
             annotated[source] = annotated_list[: max(1, top_k_per_system)]
 
-        self._offered_u_hat[user.user_id] = {
-            a.recommendation.place.place_id: a.v_hat_act - a.c_hat_travel
+        vot_hat = self.tce.get_user_vot(user.user_id)
+        self._offered[user.user_id] = {
+            a.recommendation.place.place_id: (a.v_hat_act - a.c_hat_travel, a.tau_hat, vot_hat)
             for recs in annotated.values() for a in recs
         }
         return annotated
@@ -505,19 +549,17 @@ class WelfareAwareOrchestrator:
     def record_continuous_feedback(
         self,
         feedback: ContinuousFeedback,
-        travel_time_min: float,
-        monetary_cost: float,
         mode: Optional[str] = None,
     ) -> None:
         """Record continuous feedback and update all learning components."""
         self.feedback_history.append(feedback)
 
-        # Update travel cost estimator
-        self.tce.update(feedback, travel_time_min, monetary_cost, mode=mode)
-        # Score the estimate the venue was offered with against the outcome.
-        u_hat = self._offered_u_hat.get(feedback.user_id, {}).get(feedback.place_id)
-        if u_hat is not None:
-            self.tce.record_prediction_error(feedback.user_id, feedback.realized_utility - u_hat)
+        # Score the estimate the venue was offered with against the outcome:
+        # the value of time learns from it, and so does PUP's σ_i.
+        offered = self._offered.get(feedback.user_id, {}).get(feedback.place_id)
+        self.tce.update(feedback.user_id, feedback.realized_utility, offered, mode=mode)
+        if offered is not None:
+            self.tce.record_prediction_error(feedback.user_id, feedback.realized_utility - offered[0])
 
     def record_feedback(self, user_id: int, source: str, place_id: str, liked: bool, feedback_strength: float = 1.0) -> None:
         """Backward-compatible binary feedback passthrough."""

@@ -2052,10 +2052,7 @@ class Simulation:
                 feedback_sensitivity=getattr(agent, "feedback_sensitivity", 1.0),
             )
             self.recommender_stack.record_continuous_feedback(
-                continuous_feedback,
-                travel_time_min=feedback_trip.travel_time_min,
-                monetary_cost=feedback_trip.cost,
-                mode=feedback_trip.mode,
+                continuous_feedback, mode=feedback_trip.mode,
             )
 
     # ── Day simulation ───────────────────────────────────────────────────────

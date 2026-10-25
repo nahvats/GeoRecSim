@@ -53,6 +53,14 @@
   ],
   "oracle": true,
   "surprise_weight": 12.0,
-  "pup_sigma_prior": 0.4284,
-  "pup_sigma_prior_strength": 2.0
+  "pup_sigma_prior": 0.3641,
+  "pup_sigma_prior_strength": 2.0,
+  "vot_learner": "regression_2026-10-25",
+  "vot_prior_mean": 15.0,
+  "vot_prior_sd": 10.0,
+  "vot_noise_sd": 0.43,
+  "vot_bounds": [
+    5.0,
+    50.0
+  ]
 }

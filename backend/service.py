@@ -770,6 +770,11 @@ class RunConfig:
             round(params.WELFARE_GATE_DEFAULTS["pup_sigma_prior_strength"], 4),
             ("candidate_pool", params.WELFARE_GATE_DEFAULTS["candidate_pool"]),
             "rm_catalog_benchmark",
+            # The value of time learned by regression on travel time, not
+            # from the like (2026-10-25), and its prior.
+            "vot_regression_2026-10-25",
+            tuple(params.WELFARE_GATE_DEFAULTS[k] for k in (
+                "vot_prior_mean", "vot_prior_sd", "vot_noise_sd", "vot_bounds")),
         )
         return hashlib.sha1(repr(key).encode()).hexdigest()[:16]
 
