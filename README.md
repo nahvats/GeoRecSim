@@ -1,288 +1,207 @@
-# welfare-rs — welfare-oriented activity-travel simulation
+<h1 align="center">GeoRecSim</h1>
 
-An agent-based model of how recommender systems shape activity-travel behaviour
-and traveller **welfare**, simulated on a real OpenStreetMap street network. It ships as three separable layers:
+<p align="center">
+  <b>What happens to a city when an app decides where everyone goes?</b>
+</p>
 
-```
-welfare_rs/   # the importable simulation engine (pip-installable)
-backend/      # FastAPI service: runs the simulation, including road network and agent dynamics
-frontend/     # React + TypeScript + deck.gl/MapLibre client (Vite)
-data/         # persona CSVs + data-util scripts (+ gitignored local data)
-scripts/      # warm_metros.py — prefetch all metro road networks
-```
+<p align="center">
+  <a href="https://airecsim.cusp.nyu.edu/"><img src="https://img.shields.io/badge/Live%20demo-airecsim.cusp.nyu.edu-57068c?style=for-the-badge" alt="Live demo"></a>
+</p>
 
-## Two-layer metro geography
-
-The app simulates **8 US metros** (NYC, Seattle, SF Bay Area, Chicago, Houston,
-DC, Miami, LA). Each is ONE road network thought of as two layers:
-
-* **Core** — the principal city (Manhattan for NYC; SF + Oakland for the Bay
-  Area), downloaded at full drive detail. Leisure **POIs and work locations
-  exist only here**; leisure routing is street-level.
-* **Shell** — the surrounding counties that together send **90% of the
-  commuters** into the core, reduced to the arterial skeleton
-  (motorway/trunk/primary/secondary). Dropping residential capillaries outside
-  the core is the standard MPO travel-model abstraction and keeps metro graphs
-  tractable.
-
-Agent **homes and workplaces come from real LODES8 commutes** (2023, JT01
-primary jobs). Each agent is one draw from `metro_od_pairs` — a
-`(home census block → work census block)` pair weighted by its job count — with
-both block internal points snapped onto the graph. Because the pair is drawn
-whole, home and work stay correlated and commute lengths follow the published
-distribution rather than two independent uniform draws. The county set that
-defines the shell is the same data grouped by home county, so the graph always
-covers the homes it needs to place. See `db/07_commute_tables.sql`.
-
-## Studies run concurrently
-
-Studies no longer queue behind one another. They share **one** process pool
-sized to the box, and `ResourceGovernor` splits its slots evenly between
-whoever is running: one study spreads across all 60, a second arriving halves
-both to 30, and the first widens back out when the second finishes. Nothing is
-resized or restarted — the quota is simply re-read every time a task starts.
-
-Sharing one pool rather than giving each study its own is what keeps memory
-bounded: per-study pools would hold a separate copy of every metro graph and
-leave idle processes behind whenever a study narrowed. A RAM floor sits on the
-same path, so memory pressure throttles task *starts* instead of triggering an
-OOM kill that would take every running study with it.
-
-```
-GET /api/resources      # studies running, slots each, slots busy, RAM headroom
-```
-
-Knobs: `WELFARE_RS_MAX_WORKERS` (total slots), `WELFARE_RS_MAX_STUDIES`
-(default 10), `WELFARE_RS_MIN_FREE_RAM_GB` (default 24).
-
-## Try it without any data
-
-A clone has no data: the census inputs are downloaded by scripts, the venue
-catalog is a licensed dataset you supply yourself, and the survey population is
-IRB-protected and never leaves institutional storage. To see the machinery run
-anyway:
-
-```bash
-pip install -e .
-python data/make_demo_personas.py      # writes FABRICATED personas
-python scripts/run_demo.py             # small OSM network, 50 agents, 3 days
-```
-
-Those agents are invented and the run reproduces nothing — the engine says so
-in its own output every time it loads them. The real pipeline is below.
-
-## Agents come from real people
-
-An agent is not sampled at run time. Populations are built offline and stored,
-one row per agent, from three sources used for what each alone can do:
-
-* **LODES** places it — a real home-block → work-block commute, weighted by
-  jobs, which also fixes that job's age, earnings and industry band.
-* **ACS PUMS**, reweighted to the home tract with IPU, says who lives there:
-  one real person's age, own earnings, household income, vehicles, disability
-  and household size, *jointly*.
-* **The survey** (IRB-FY2026-11354) supplies psychometrics, matched to that
-  person on sex, employment, income band and age band.
-
-Non-workers are drawn from **core blocks only**. Their leisure trip departs
-from home rather than a workplace, so metro-wide homes would put much of the
-population 30–60 km from every venue and swamp every distance-normalised
-metric. The population is therefore *people whose day is anchored in the core*.
-
-Full design, approximations and limitations: **`docs/acs-population.md`**.
-Build it with `db/fetch_census_data.py` → `db/load_pums.py` → `db/load_acs.py`
-→ `db/build_tract_weights.py` → `db/build_population.py`, then verify with
-`scripts/verify_acs_population.py`. The repo carries the scripts; the data is
-downloaded by them and never committed.
-
-Cars route on **fastest network paths** (per-edge OSM speeds), so freeway
-commutes behave like freeway commutes; congestion and weather scale that time.
-
-**Data policy: all data lives on disk (or the lab server's Postgres) — never in
-git.** The county-flow registry, filtered POI CSVs, commute pairs, boundary
-polygons, and network caches are all local artifacts.
-`welfare_rs/datasource.py` is the one place that knows where data comes from:
-`LocalDataSource` (default) reads those files; `PostgresDataSource` serves
-identical shapes from the server DB — set `WELFARE_RS_DATASOURCE=postgres` and
-`WELFARE_RS_PG_DSN=postgresql://…` (table schemas are documented in that
-module). Without commute data the engine falls back to its earlier provisional
-placement: a county-weighted home plus a uniform workplace inside the core.
-
-A metro's first-ever build geocodes boundaries (Nominatim) and downloads the
-graph (Overpass) — minutes to tens of minutes per metro. Prefetch everything
-once with:
-
-```bash
-python scripts/warm_metros.py            # or: python scripts/warm_metros.py miami seattle
-```
-
-The browser never holds the whole run: it streams only the agent **positions**
-in the current time window + map viewport, and fetches a trip's full **street
-geometry** on demand (when you click a moving dot). This lets the visualization
-scale to large populations / many days without falling over.
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.10%2B-3776ab" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/backend-FastAPI-009688" alt="FastAPI">
+  <img src="https://img.shields.io/badge/frontend-React%20%2B%20deck.gl-61dafb" alt="React + deck.gl">
+  <img src="https://img.shields.io/badge/maps-OpenStreetMap-7ebc6f" alt="OpenStreetMap">
+</p>
 
 ---
 
-## 1. Install
+When you look for dinner, a coffee shop or a gym, an app usually picks the
+shortlist. Those apps don't just reflect what people want, they shape it. The
+places that get recommended get the visits, and the visits make them look even
+more worth recommending. Add that up across a whole city and it changes which
+neighborhoods get business, how far people travel, and who ends up better off.
 
-Requires Python ≥ 3.10 and (for the frontend) Node ≥ 18.
+**GeoRecSim** is a simulation for studying that effect. It builds a population
+of people for a real US city, puts them on the city's actual street network,
+and lets them decide where to go after work, either on their own or with a
+recommender's help. You choose how the recommender ranks places, run the city
+for days or weeks, and compare what happened against the same city with no
+recommender at all.
+
+**[Try it in your browser →](https://airecsim.cusp.nyu.edu/)** No install needed.
+
+<p align="center">
+  <img src="docs/img/georecsim-overview.png" alt="GeoRecSim overview: data sources feed a spatial environment of agents and venues; a tunable recommender ranks venues for each agent; the run reports footfall and visitor concentration, net utility by income, trip costs and activity benefit over time." width="100%">
+</p>
+
+## How it works
+
+The figure reads left to right.
+
+**1. Real data in.** The city is built from public and survey data (green is
+empirical, yellow is survey-derived):
+
+| Source | What it gives the simulation |
+|---|---|
+| OpenStreetMap | the street network everyone travels on |
+| LODES | real home → work commutes, so people live and work where people actually do |
+| ACS | who lives where: age, income, household, car ownership |
+| National POI catalog | real restaurants, cafés, gyms, parks, museums and music venues |
+| Survey (473 people) | how people feel about platforms, their personalities and leisure preferences |
+
+**2. People with their own way of deciding.** Each agent has a home, a job, an
+income, a value of time and hidden tastes (say, a soft spot for pizza). After
+work they decide whether to go out and where. Not everyone decides the same
+way: some weigh every option carefully, some settle for good enough, some
+avoid regret, and some just repeat what they did last time. Trips happen on
+the real street network by foot, bike-share, car or taxi, and each one costs
+time, money and CO₂.
+
+**3. A recommender you can tune.** The recommender scores venues on six
+things: rating, number of reviews, relevance, proximity, popularity and
+personalization. You set how much each one counts. Turn up proximity and you
+get something like a maps app; turn up popularity and you get a "trending"
+feed. Agents decide whether to trust each suggestion, leave feedback after
+the visit, and that feedback updates ratings, footfall and what the
+recommender knows about them. Tomorrow's ranking depends on today's trips.
+
+**4. Outcomes out.** Every run is compared against a matched control where
+nobody uses a recommender, so every difference you see is caused by the
+platform. You get:
+
+- **Footfall concentration**: do visits pile into a handful of venues?
+- **Visitor concentration**: which venues and neighborhoods win or lose customers
+- **Net utility by income**: who actually came out ahead, and who paid for it
+- **Trip costs**: extra distance, travel time and emissions
+- **Activity benefit over time**: whether the recommender learns people's tastes
+
+A second control, an "oracle" that knows everyone's true preferences, shows
+the best any recommender could do.
+
+## Questions you can ask with it
+
+- Does a popularity-heavy recommender funnel everyone into the same few places?
+- If a platform favors nearby venues, does it cut driving and emissions? What
+  does that cost people in enjoyment?
+- Do the benefits of a recommender reach low-income travelers, or mostly
+  people who can afford longer trips?
+- Can a welfare filter, one that only shows options likely to leave someone
+  better off, keep the upside without the downsides?
+
+## Cities
+
+Eight US metro areas: **New York, Los Angeles, Chicago, Houston, Washington DC,
+Miami, Seattle** and the **San Francisco Bay Area**.
+
+Venues and workplaces sit in the principal city (Manhattan for New York; San
+Francisco and Oakland for the Bay Area). Homes extend across the surrounding
+counties that send 90% of commuters into it.
+
+## Quick start
+
+The easiest way in is the [live site](https://airecsim.cusp.nyu.edu/). To run
+it yourself:
+
+### Run a small demo
+
+No data download or database needed.
 
 ```bash
-# from the repo root — engine + backend, editable
+git clone https://github.com/nahvats/GeoRecSim.git
+cd GeoRecSim
+pip install -e .
+python data/make_demo_personas.py
+python scripts/run_demo.py
+```
+
+This runs 50 made-up people on a small piece of Manhattan for 3 days. It's
+for checking that everything works. The people are invented, so the numbers
+don't mean anything.
+
+### Run the web app locally
+
+```bash
 pip install -e .[server]
-
-# or everything used in this repo (engine + backend + paper notebook)
-pip install -r requirements.txt
+cd backend && uvicorn main:app --reload --port 8000
 ```
 
-The engine pulls `osmnx`, which brings `geopandas`/`pandas`/`shapely`. The first
-run for an area **downloads and caches** that area's OSM network under `.cache/`
-(set `WELFARE_RS_CACHE` to relocate it); subsequent runs are fully local.
-
-> **Env note:** if you see `A module compiled using NumPy 1.x cannot be run in
-> NumPy 2.x … _ARRAY_API not found`, that's a pre-existing mismatch between
-> `pyarrow` (built against NumPy 1.x) and a NumPy 2.x environment. It's a warning,
-> not a failure. Fix it with `pip install -U pyarrow` or `pip install "numpy<2"`.
-
-## 2. Run the app (development)
-
-Two processes. **Terminal A — backend:**
+In a second terminal:
 
 ```bash
-cd backend
-uvicorn main:app --reload --port 8000
+cd frontend && npm install && npm run dev
 ```
 
-**Terminal B — frontend (Vite dev server, proxies `/api` to :8000):**
+Then open <http://localhost:5173>. More options, including a single-server
+setup and the HTTP API, are in [docs/running-the-app.md](docs/running-the-app.md).
 
-```bash
-cd frontend
-npm install
-npm run dev          # http://localhost:5173
-```
+### Use it from Python
 
-Open http://localhost:5173, pick an area, set options, press **Run**.
-
-## 3. Run the app (single server, production-style)
-
-Build the frontend once; FastAPI then serves it as static files at `/`:
-
-```bash
-cd frontend && npm install && npm run build      # -> frontend/dist
-cd ../backend && uvicorn main:app --port 8000     # http://localhost:8000
-```
-
-## 4. Use the engine as a library
-
-`welfare_rs` has no web or visualization dependency. Import and drive it directly:
+The simulation engine (`welfare_rs`) works on its own, with no web stack:
 
 ```python
 from welfare_rs import Simulation, build_metro_network, params
 
-net = build_metro_network("miami")                     # cached after first build
+net = build_metro_network("miami")          # downloaded once, then cached
 sim = Simulation(
-    num_agents=80, seed=42, road_network=net,
-    persona_csv_path=params.NYC_PERSONA_CSV_PATH,      # behavioural columns only
-    disabled_modes=("transit",),
+    num_agents=80,
+    seed=42,
+    road_network=net,
+    persona_csv_path=params.NYC_PERSONA_CSV_PATH,
 )
-day_summaries = sim.run_days(3)
+sim.run_days(3)
 print(sim.summarize())
 ```
 
-Legacy single-area presets (`build_road_network("nyc_manhattan")`, …) still
-work for engine-level experiments; the app itself only surfaces the 8 metros.
+## About the data
 
+The repo contains code, not data. Census files are large and re-downloadable,
+the venue catalog is licensed, and the survey responses are IRB-protected and
+stay on university storage. Scripts in [`db/`](db/) rebuild every piece, and
+[docs/data.md](docs/data.md) explains where each input comes from and how to
+build it.
 
-## 5. Recommenders: one scorer, many configurations
+## What's in the repo
 
-A study is the **No-RS control**, the **Oracle control** (below) and up to five recommenders the user builds in
-the sidebar. Every recommender is the *same* scorer with different knob values —
-the presets ("Proximity-led", "Footfall-led", "Viral", …) differ by which weights they
-zero out, not by having different machinery:
-
-| Knob | Meaning |
+| Folder | What it is |
 |---|---|
-| `w_rating` / `w_reviews` | POI prominence; both move as agents leave feedback |
-| `w_relevance` | category fit — near-constant within a subtype, and impersonal by design |
-| `w_proximity` | `exp(-d / distance_scale_km)`, straight-line |
-| `w_popularity` | live footfall relative to the busiest candidate — the feedback loop |
-| `w_personalization` | learned per-agent affinity; the only personal channel |
-| `popularity_gamma` | exponent on relative footfall: <1 flattens, >1 concentrates |
-| `learning_rate` | how fast feedback moves the user model |
-| `welfare_gate` | optional PUP / RM filter on top of the ranking |
+| [`welfare_rs/`](welfare_rs/) | the simulation engine, installable with `pip install -e .` |
+| [`backend/`](backend/) | FastAPI service that runs simulations and streams results to the map |
+| [`frontend/`](frontend/) | React + TypeScript web app (deck.gl and MapLibre) |
+| [`db/`](db/) | database schema and scripts that build the population and venue tables |
+| [`data/`](data/) | persona builders and the demo population |
+| [`scripts/`](scripts/) | the demo, network prefetching, study runners and checks |
+| [`gating_study/`](gating_study/) | experiments on welfare filters, with results |
+| [`docs/`](docs/) | longer write-ups (below) |
 
-Weights are renormalized to sum to 1 and every component is bounded in [0, 1], so
-**scores are comparable across configurations**. That matters: the previous
-design had `PopularityRecommender` min-max normalizing (top candidate always
-~1.0) while `GoogleMapsReplica` emitted a raw weighted sum topping out near 0.75,
-so the popularity platform structurally won every cross-platform comparison and
-inflated acceptance (eta reads `score - 0.5`) for reasons that were pure scale.
+## Documentation
 
-On a cold start the popularity column does not exist yet; its weight is
-redistributed over the remaining components rather than counted as a zero, which
-would otherwise cap a popularity-heavy recommender at a low score for the whole
-warm-up.
+- [Running the app](docs/running-the-app.md): install, local setup, HTTP API, running many studies at once
+- [The recommender](docs/recommender.md): every knob, the oracle control, welfare filters, hidden tastes
+- [Data](docs/data.md): cities, commutes, venues, and how to rebuild everything
+- [The agent population](docs/acs-population.md): how census and survey data become agents
+- [What the survey covers](docs/survey-coverage.md): which agent traits are measured and which are not
+- [Getting around](docs/multimodal.md): walking, bike-share, car and taxi
 
-**Oracle** is a second control, always run, and the one arm that is not this
-scorer. It is the perfect-knowledge upper bound of Uğurel & Yabe (2026,
-condition 5): it reads the agent's true preferences, latent tastes included, and
-offers the venue of the chosen subtype with the highest net utility
-`U = V − C`. `V` is the activity benefit the trip is credited with on arrival,
-and `C` is the agent's own expected round-trip cost, the one it ranks its own
-options with. Like the paper's oracle it ranks on the ex-ante view and does not
-see congestion or the agent's organic pick, so it can still harm some agents.
-Its score is a neutral 0.5, so eta's quality term is zero and acceptance works
-exactly as for every other arm: the gap to the other arms is ranking knowledge
-alone. Weights and the welfare gate are ignored. See `welfare_rs/oracle_rs.py`.
+## Team
 
-### Latent tastes
+GeoRecSim is built at New York University by
+**Nahush Shrivatsa**, **Ekin Uğurel** and **Takahiro Yabe**.
 
-Each POI carries taste tags recovered from its business name ("Joe's Pizza" →
-`pizza`); each agent holds a latent favourite per family (`dining`, `cafe`,
-`fitness`, `outdoor`, `culture`, `music`), drawn from the catalog's own supply mix
-with a tempering exponent `beta` (`welfare_rs/tastes.py`).
+It is a research prototype and still under active development. If something
+breaks or you'd like to use it in your own work, please
+[open an issue](https://github.com/nahvats/GeoRecSim/issues).
 
-The recommenders **cannot see** the taste. It moves the agent's realised activity
-utility, that utility drives like/dislike feedback, and personalization infers the
-taste from there — so taste discovery is a genuine learning problem rather than a
-lookup. Two caveats worth knowing:
+## Citation
 
-* Only ~50% of real POIs name their type, and *which* ones do is biased (pizza and
-  thai self-label; korean and new-american almost never). Unlabelled venues are
-  **imputed** a tag from the observed distribution for their family, keyed on a
-  hash of the place id, rather than being scored as "definitely not thai" —
-  which would have been a systematic penalty on half the catalog.
-* Tastes are sampled from name-identifiable venue frequency, which is a proxy for
-  cuisine demand, not a measurement of it.
+A paper describing GeoRecSim is in preparation. Until then, please cite:
 
-## 6. HTTP API (under `/api`)
-
-| Method | Path | Purpose |
-|---|---|---|
-| GET  | `/api/cities` | the 8 metros, recommender presets, per-city POI availability, default config |
-| POST | `/api/runs` | start (or hit cached) run → `run_id` |
-| GET  | `/api/runs/{id}` | run summary + view/bounds/metrics |
-| GET  | `/api/runs/{id}/events` | SSE per-day progress |
-| GET  | `/api/runs/{id}/timeline?t0&t1&bbox` | windowed, viewport-culled trip/stay keyframes |
-| GET  | `/api/runs/{id}/positions?t&bbox` | exact-instant positions (interpolated on real routes) |
-| GET  | `/api/runs/{id}/trips/{trip_id}/geometry` | **full** street polyline for one trip (on demand) |
-| GET  | `/api/runs/{id}/pois?bbox` | POIs inside the viewport |
-
-Interactive docs at `/docs` (FastAPI/Swagger). `bbox` is `south,west,north,east`.
-
-## 7. POI data
-
-Real POIs come from small per-metro CSVs
-(`<cache>/pois/<metro>_leisure_pois.csv`), each produced by one streaming pass
-of `data/filter_metro_pois.py` over the raw Placekey/NAICS dump
-(`data/poi_children_merged_by_wkt.csv`, ~375 MB, gitignored) clipped to that
-metro's core-city polygon.
-
-> **Note:** the raw dump on hand covers the **NYC region only** (despite its
-> all-US framing), so today only NYC has real POIs; the other 7 metros fall
-> back to synthetic POIs placed on core-city intersections (the "Real POIs"
-> toggle disables itself per city). Nationwide POIs arrive with the server DB
-> (`metro_pois` table — see `welfare_rs/datasource.py`).
-
-Per the data policy above, none of these files are committed — regenerate them
-locally with the filter script, or load them from Postgres on the server.
+```bibtex
+@misc{shrivatsa2026georecsim,
+  title        = {GeoRecSim: A Multi-Agent Testbed for Recommender System Design},
+  author       = {Shrivatsa, Nahush and Ugurel, Ekin and Yabe, Takahiro},
+  year         = {2026},
+  howpublished = {\url{https://github.com/nahvats/GeoRecSim}}
+}
+```
