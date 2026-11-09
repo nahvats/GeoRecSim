@@ -1,7 +1,7 @@
 <h1 align="center">GeoRecSim</h1>
 
 <p align="center">
-  <b>What happens to a city when an app decides where everyone goes?</b>
+  A city-scale simulation of how recommendation apps shape urban mobility.
 </p>
 
 <p align="center">
@@ -17,20 +17,20 @@
 
 ---
 
-When you look for dinner, a coffee shop or a gym, an app usually picks the
-shortlist. Those apps don't just reflect what people want, they shape it. The
-places that get recommended get the visits, and the visits make them look even
-more worth recommending. Add that up across a whole city and it changes which
-neighborhoods get business, how far people travel, and who ends up better off.
+Apps like Google Maps and Yelp decide which restaurants, cafés and gyms people
+see when they look for somewhere to go. Recommended places get more visits, and
+more visits make them more likely to be recommended again. Across a city, this
+affects which businesses get customers, how far people travel, and which
+groups benefit.
 
-**GeoRecSim** is a simulation for studying that effect. It builds a population
-of people for a real US city, puts them on the city's actual street network,
-and lets them decide where to go after work, either on their own or with a
-recommender's help. You choose how the recommender ranks places, run the city
-for days or weeks, and compare what happened against the same city with no
-recommender at all.
+GeoRecSim simulates this process. It builds a population for a real US city
+from census and survey data, places people on the city's street network, and
+has them choose where to go after work, either on their own or from a
+recommender's suggestions. You set how the recommender ranks venues, run the
+simulation for a number of days, and compare the results with a run where no
+one uses a recommender.
 
-**[Try it in your browser →](https://airecsim.cusp.nyu.edu/)** No install needed.
+The simulation is live at [airecsim.cusp.nyu.edu](https://airecsim.cusp.nyu.edu/).
 
 <p align="center">
   <img src="docs/img/georecsim-overview.png" alt="GeoRecSim overview: data sources feed a spatial environment of agents and venues; a tunable recommender ranks venues for each agent; the run reports footfall and visitor concentration, net utility by income, trip costs and activity benefit over time." width="100%">
@@ -38,75 +38,75 @@ recommender at all.
 
 ## How it works
 
-The figure reads left to right.
+### Data
 
-**1. Real data in.** The city is built from public and survey data (green is
-empirical, yellow is survey-derived):
+The simulation is built from the following sources. In the figure, green marks
+empirical data and yellow marks data from our survey.
 
-| Source | What it gives the simulation |
+| Source | Used for |
 |---|---|
-| OpenStreetMap | the street network everyone travels on |
-| LODES | real home → work commutes, so people live and work where people actually do |
-| ACS | who lives where: age, income, household, car ownership |
-| National POI catalog | real restaurants, cafés, gyms, parks, museums and music venues |
-| Survey (473 people) | how people feel about platforms, their personalities and leisure preferences |
+| OpenStreetMap | street networks for walking, cycling and driving |
+| LODES | home and work locations, drawn from real commute flows |
+| ACS | age, income, household size and car ownership |
+| National POI catalog | restaurants, cafés, gyms, parks, museums and music venues |
+| Survey (473 respondents) | attitudes toward platforms, personality and leisure preferences |
 
-**2. People with their own way of deciding.** Each agent has a home, a job, an
-income, a value of time and hidden tastes (say, a soft spot for pizza). After
-work they decide whether to go out and where. Not everyone decides the same
-way: some weigh every option carefully, some settle for good enough, some
-avoid regret, and some just repeat what they did last time. Trips happen on
-the real street network by foot, bike-share, car or taxi, and each one costs
-time, money and CO₂.
+### Agents
 
-**3. A recommender you can tune.** The recommender scores venues on six
-things: rating, number of reviews, relevance, proximity, popularity and
-personalization. You set how much each one counts. Turn up proximity and you
-get something like a maps app; turn up popularity and you get a "trending"
-feed. Agents decide whether to trust each suggestion, leave feedback after
-the visit, and that feedback updates ratings, footfall and what the
-recommender knows about them. Tomorrow's ranking depends on today's trips.
+Each agent has a home, a workplace, an income, a value of time, and food and
+activity preferences that the recommender can't see. After work, agents decide
+whether to go out and where. They use different decision rules: some maximize
+utility, some pick the first acceptable option, some minimize regret, and some
+repeat past choices. Trips are routed on the street network by walking,
+bike-share, car or taxi, and each trip has a time, money and CO₂ cost.
 
-**4. Outcomes out.** Every run is compared against a matched control where
-nobody uses a recommender, so every difference you see is caused by the
-platform. You get:
+### Recommender
 
-- **Footfall concentration**: do visits pile into a handful of venues?
-- **Visitor concentration**: which venues and neighborhoods win or lose customers
-- **Net utility by income**: who actually came out ahead, and who paid for it
-- **Trip costs**: extra distance, travel time and emissions
-- **Activity benefit over time**: whether the recommender learns people's tastes
+The recommender scores venues on rating, number of reviews, relevance,
+proximity, popularity and personalization, with weights you set. A high
+proximity weight behaves like a maps app, and a high popularity weight behaves
+like a trending feed. Agents accept or ignore each suggestion depending on how
+much they trust the platform. After a visit they rate it, and the ratings
+update venue scores, visit counts and the recommender's model of each agent,
+so later recommendations depend on earlier trips.
 
-A second control, an "oracle" that knows everyone's true preferences, shows
-the best any recommender could do.
+### Metrics
 
-## Questions you can ask with it
+Each run is compared with a control run that uses the same random seed and no
+recommender. A second control, an oracle that knows every agent's true
+preferences, gives an upper bound. The simulation reports:
 
-- Does a popularity-heavy recommender funnel everyone into the same few places?
-- If a platform favors nearby venues, does it cut driving and emissions? What
-  does that cost people in enjoyment?
-- Do the benefits of a recommender reach low-income travelers, or mostly
-  people who can afford longer trips?
-- Can a welfare filter, one that only shows options likely to leave someone
-  better off, keep the upside without the downsides?
+- **Footfall concentration**: how visits are spread across venues
+- **Visitor concentration**: visits per venue and by area
+- **Net utility by income group**
+- **Trip costs**: distance, travel time and CO₂
+- **Activity benefit by day**
+
+## Research questions
+
+- Does weighting popularity concentrate visits in a small number of venues?
+- Does weighting proximity reduce driving and emissions, and how does it change
+  the benefit people get from their trips?
+- How are gains and losses distributed across income groups?
+- Can a welfare filter, which only shows options likely to leave the user
+  better off, reduce these costs?
 
 ## Cities
 
-Eight US metro areas: **New York, Los Angeles, Chicago, Houston, Washington DC,
-Miami, Seattle** and the **San Francisco Bay Area**.
+New York, Los Angeles, Chicago, Houston, Washington DC, Miami, Seattle and the
+San Francisco Bay Area.
 
-Venues and workplaces sit in the principal city (Manhattan for New York; San
-Francisco and Oakland for the Bay Area). Homes extend across the surrounding
-counties that send 90% of commuters into it.
+Venues and workplaces are in the principal city (Manhattan for New York; San
+Francisco and Oakland for the Bay Area). Homes cover the surrounding counties
+that account for 90% of commuters into it.
 
-## Quick start
+## Running it locally
 
-The easiest way in is the [live site](https://airecsim.cusp.nyu.edu/). To run
-it yourself:
+### Demo
 
-### Run a small demo
-
-No data download or database needed.
+The demo runs without any data downloads or database. It uses 50 synthetic
+agents on a small part of Manhattan for 3 days, so its output is only useful
+for checking the installation.
 
 ```bash
 git clone https://github.com/nahvats/GeoRecSim.git
@@ -116,11 +116,7 @@ python data/make_demo_personas.py
 python scripts/run_demo.py
 ```
 
-This runs 50 made-up people on a small piece of Manhattan for 3 days. It's
-for checking that everything works. The people are invented, so the numbers
-don't mean anything.
-
-### Run the web app locally
+### Web app
 
 ```bash
 pip install -e .[server]
@@ -133,12 +129,13 @@ In a second terminal:
 cd frontend && npm install && npm run dev
 ```
 
-Then open <http://localhost:5173>. More options, including a single-server
-setup and the HTTP API, are in [docs/running-the-app.md](docs/running-the-app.md).
+The app runs at <http://localhost:5173>. See
+[docs/running-the-app.md](docs/running-the-app.md) for a single-server setup
+and the HTTP API.
 
-### Use it from Python
+### Python
 
-The simulation engine (`welfare_rs`) works on its own, with no web stack:
+The simulation engine (`welfare_rs`) can be used without the web app:
 
 ```python
 from welfare_rs import Simulation, build_metro_network, params
@@ -154,48 +151,46 @@ sim.run_days(3)
 print(sim.summarize())
 ```
 
-## About the data
+## Data
 
-The repo contains code, not data. Census files are large and re-downloadable,
-the venue catalog is licensed, and the survey responses are IRB-protected and
-stay on university storage. Scripts in [`db/`](db/) rebuild every piece, and
-[docs/data.md](docs/data.md) explains where each input comes from and how to
-build it.
+The repository contains code only. Census files are large and can be
+re-downloaded, the venue catalog is licensed, and the survey responses are
+covered by an IRB protocol and stored on university servers. The scripts in
+[`db/`](db/) rebuild each dataset, and [docs/data.md](docs/data.md) describes
+the sources and build steps.
 
-## What's in the repo
+## Repository layout
 
-| Folder | What it is |
+| Folder | Contents |
 |---|---|
-| [`welfare_rs/`](welfare_rs/) | the simulation engine, installable with `pip install -e .` |
+| [`welfare_rs/`](welfare_rs/) | simulation engine (`pip install -e .`) |
 | [`backend/`](backend/) | FastAPI service that runs simulations and streams results to the map |
 | [`frontend/`](frontend/) | React + TypeScript web app (deck.gl and MapLibre) |
 | [`db/`](db/) | database schema and scripts that build the population and venue tables |
 | [`data/`](data/) | persona builders and the demo population |
-| [`scripts/`](scripts/) | the demo, network prefetching, study runners and checks |
-| [`gating_study/`](gating_study/) | experiments on welfare filters, with results |
-| [`docs/`](docs/) | longer write-ups (below) |
+| [`scripts/`](scripts/) | demo, network prefetching, study runners and checks |
+| [`gating_study/`](gating_study/) | welfare filter experiments and results |
+| [`docs/`](docs/) | documentation |
 
 ## Documentation
 
-- [Running the app](docs/running-the-app.md): install, local setup, HTTP API, running many studies at once
-- [The recommender](docs/recommender.md): every knob, the oracle control, welfare filters, hidden tastes
-- [Data](docs/data.md): cities, commutes, venues, and how to rebuild everything
-- [The agent population](docs/acs-population.md): how census and survey data become agents
-- [What the survey covers](docs/survey-coverage.md): which agent traits are measured and which are not
-- [Getting around](docs/multimodal.md): walking, bike-share, car and taxi
+- [Running the app](docs/running-the-app.md): installation, local setup, HTTP API, concurrent studies
+- [Recommender](docs/recommender.md): scoring weights, the oracle control, welfare filters, hidden preferences
+- [Data](docs/data.md): cities, commutes, venues and rebuilding the datasets
+- [Agent population](docs/acs-population.md): how census and survey data are combined into agents
+- [Survey coverage](docs/survey-coverage.md): which agent attributes come from the survey
+- [Travel modes](docs/multimodal.md): walking, bike-share, car and taxi
 
 ## Team
 
-GeoRecSim is built at New York University by
-**Nahush Shrivatsa**, **Ekin Uğurel** and **Takahiro Yabe**.
-
-It is a research prototype and still under active development. If something
-breaks or you'd like to use it in your own work, please
-[open an issue](https://github.com/nahvats/GeoRecSim/issues).
+GeoRecSim is developed at New York University by Nahush Shrivatsa, Ekin Uğurel
+and Takahiro Yabe. It is a research prototype under active development.
+Questions and bug reports go in the
+[issue tracker](https://github.com/nahvats/GeoRecSim/issues).
 
 ## Citation
 
-A paper describing GeoRecSim is in preparation. Until then, please cite:
+A paper is in preparation. In the meantime, please cite:
 
 ```bibtex
 @misc{shrivatsa2026georecsim,
